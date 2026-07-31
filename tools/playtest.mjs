@@ -11,7 +11,14 @@ import { MAPS } from '../src/maps.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BASE = process.argv[2] ?? 'http://localhost:8101/';
+// Guard against a caller passing the literal string "undefined"/"null"
+// instead of actually omitting the argument -- see flowtest.mjs for the
+// failure mode that provoked this.
+function resolveArg(raw, fallback) {
+  return (!raw || raw === 'undefined' || raw === 'null') ? fallback : raw;
+}
+
+const BASE = resolveArg(process.argv[2], 'http://localhost:8101/');
 const WAVES = Number(process.argv[3]) || 0;   // 0 = use each map's own target
 const SPEED = Number(process.argv[4]) || 8;
 const TIMEOUT_MS = 180000;

@@ -8,8 +8,16 @@ import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-const URL_ = process.argv[2] ?? 'http://localhost:8101/';
-const SECONDS = Number(process.argv[3]) || 9;
+// A caller (orchestrator, shell wrapper, whatever) can pass the literal string
+// "undefined" or "null" instead of actually omitting the argument -- that used
+// to sail straight into Chrome as a nav target, load nothing, and still exit 0.
+// Treat those placeholder strings the same as "not given".
+function resolveArg(raw, fallback) {
+  return (!raw || raw === 'undefined' || raw === 'null') ? fallback : raw;
+}
+
+const URL_ = resolveArg(process.argv[2], 'http://localhost:8101/');
+const SECONDS = Number(resolveArg(process.argv[3], '9')) || 9;
 const OUT = join(import.meta.dirname, '..', 'shots');
 if (!existsSync(OUT)) mkdirSync(OUT);
 
@@ -96,6 +104,15 @@ const probe = await call('Runtime.evaluate', {
 });
 console.log(`heartbeat: ${probe?.result?.value ?? '(none)'}`);
 
+// A page that never loaded (bad nav target, crash before init, etc.) produces
+// zero console errors and a blank screenshot -- exit 0 was a false green.
+// __biomass missing is itself a failure, not just something to log.
+let heartbeatOk = false;
+try {
+  const parsed = JSON.parse(probe?.result?.value ?? 'null');
+  heartbeatOk = parsed !== null && parsed !== 'no heartbeat';
+} catch {}
+
 const shot = await call('Page.captureScreenshot', { format: 'png' });
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 const file = join(OUT, `smoke-${stamp}.png`);
@@ -105,9 +122,10 @@ const errs = logs.filter((l) => /EXCEPTION|\[error\]|\[SEVERE\]/i.test(l));
 console.log(`--- ${logs.length} log lines, ${errs.length} errors ---`);
 for (const l of logs.slice(0, 60)) console.log(l);
 console.log(`screenshot: ${file}`);
+if (!heartbeatOk) console.log('FAIL: no __biomass heartbeat -- page never loaded / never initialized');
 
 ws.close();
 // Only ever tear down the throwaway profile's own process tree. Never a broad
 // taskkill: the user's normal Chrome windows are not ours to close.
 try { child.kill(); } catch {}
-process.exit(errs.length ? 1 : 0);
+process.exit(errs.length || !heartbeatOk ? 1 : 0);

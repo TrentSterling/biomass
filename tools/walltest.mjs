@@ -21,7 +21,14 @@ import { MAPS } from '../src/maps.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BASE = process.argv[2] ?? 'http://localhost:8101/';
+// Guard against a caller passing the literal string "undefined"/"null"
+// instead of actually omitting the argument -- see flowtest.mjs for the
+// failure mode that provoked this.
+function resolveArg(raw, fallback) {
+  return (!raw || raw === 'undefined' || raw === 'null') ? fallback : raw;
+}
+
+const BASE = resolveArg(process.argv[2], 'http://localhost:8101/');
 // Sized to the map, not picked for drama. The board is 96x56 = 5376 units of
 // floor and a body covers pi*0.22^2 = 0.152, so about 24,000 bodies is a solid
 // hexagonal pack wall to wall. The first version of this test flooded 120,000,

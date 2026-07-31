@@ -17,7 +17,17 @@ import { MAPS } from '../src/maps.js';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BASE = process.argv[2] ?? 'http://localhost:8101/';
+// A caller can pass the literal string "undefined"/"null" instead of actually
+// omitting the argument. That used to become the nav target verbatim --
+// `${BASE}?map=0&...` resolves to a bogus non-navigable URL, CDP hands back a
+// tab with no webSocketDebuggerUrl, `new WebSocket(undefined)` never opens,
+// and the top-level await on it hangs until Node kills the process with
+// "unsettled top-level await" (exit 13) after the very first map.
+function resolveArg(raw, fallback) {
+  return (!raw || raw === 'undefined' || raw === 'null') ? fallback : raw;
+}
+
+const BASE = resolveArg(process.argv[2], 'http://localhost:8101/');
 const SPAWN = 3000;
 const DEADLINE_S = 70;          // generous: slowest zombie crossing the longest map
 

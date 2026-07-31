@@ -11,7 +11,14 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const BASE = process.argv[2] ?? 'http://localhost:8101/';
+// Guard against a caller passing the literal string "undefined"/"null"
+// instead of actually omitting the argument -- see flowtest.mjs for the
+// failure mode that provoked this.
+function resolveArg(raw, fallback) {
+  return (!raw || raw === 'undefined' || raw === 'null') ? fallback : raw;
+}
+
+const BASE = resolveArg(process.argv[2], 'http://localhost:8101/');
 const STEP = Number(process.argv[3]) || 25000;
 const CAP = Number(process.argv[4]) || 1500000;
 // The capacity cap is ours, not the hardware's: bench above it or you measure
