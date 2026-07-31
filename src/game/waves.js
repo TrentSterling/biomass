@@ -18,6 +18,16 @@ export function composition(n) {
   ];
   if (n >= 2) entries.push({ type: 2, count: Math.round(120 + n * 130), dur: 8 });
   if (n >= 3) entries.push({ type: 1, count: Math.round(10 + n * 14), dur: 10 });
+  // Crawlers: cheap and fast, thrown in from wave 2 as a swarm alongside the
+  // sprinters. Linear like the other secondary types (no n*n term) so they
+  // do not compound against the shambler curve at high waves: about 30% of
+  // wave 2's headcount, easing off in share as the shambler count takes over
+  // the way sprinter's share already does.
+  if (n >= 2) entries.push({ type: 4, count: Math.round(400 + n * 380), dur: 7 });
+  // Husks: tougher squads, not a swarm, so a shorter drip window than the
+  // crawlers. Held back to wave 4 so wave 1-3 stay a pure shambler/sprinter/
+  // bloater ramp; linear count, about 20% of wave 4's headcount.
+  if (n >= 4) entries.push({ type: 3, count: Math.round(1092 + n * 280), dur: 9 });
   return entries;
 }
 

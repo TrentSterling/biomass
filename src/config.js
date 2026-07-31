@@ -161,6 +161,12 @@ export const ZOMBIE_TYPES = [
   { name: 'shambler', hp: 12,  speed: 4.2, gold: 1, scale: 0.46 },
   { name: 'bloater',  hp: 160, speed: 2.6, gold: 8, scale: 0.80 },
   { name: 'sprinter', hp: 7,   speed: 7.4, gold: 2, scale: 0.40 },
+  // Bulky, tanky, slow: a squad problem rather than a swarm problem. Tile 3
+  // in the atlas (drawHusk). Scale stays under the 0.80 hash-cell ceiling.
+  { name: 'husk',     hp: 70,  speed: 3.2, gold: 5, scale: 0.68 },
+  // Cheap and fast, meant to be thrown at the player in large numbers. Tile 4
+  // in the atlas (drawCrawler).
+  { name: 'crawler',  hp: 5,   speed: 5.2, gold: 1, scale: 0.38 },
 ];
 
 // Rampart footprint in sim cells: half an authored block, so a 4-cell corridor
