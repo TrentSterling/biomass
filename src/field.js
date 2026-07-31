@@ -274,14 +274,43 @@ export class Field {
         const o = i * 4;
         let bx = 0, by = 0, best = walls[i] ? Infinity : cost[i];
 
-        for (const [dx, dy] of NEIGHBOURS) {
-          const nx = x + dx, ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-          const ni = ny * w + nx;
-          if (walls[ni]) continue;
-          if (dx && dy && (walls[y * w + nx] || walls[ny * w + x])) continue;
-          const c = cost[ni];
-          if (c < best) { best = c; bx = dx; by = dy; }
+        // Direction from the GRADIENT of the cost field, by central differences,
+        // rather than from "which of my eight neighbours is cheapest".
+        //
+        // The cheapest-neighbour rule can only ever produce eight directions, so
+        // the crowd marches down 45 degree lanes and the grid is plainly visible
+        // in the movement no matter how much the shader blends between cells.
+        // The gradient is continuous, and costs its own dot product to compute.
+        if (!walls[i] && Number.isFinite(cost[i])) {
+          const at = (ax, ay) => {
+            if (ax < 0 || ay < 0 || ax >= w || ay >= h) return null;
+            const ni = ay * w + ax;
+            if (walls[ni] || !Number.isFinite(cost[ni])) return null;
+            return cost[ni];
+          };
+          const c0 = cost[i];
+          // One-sided where a neighbour is rock, so the gradient still leans away
+          // from geometry instead of collapsing to zero against it.
+          const L = at(x - 1, y), R = at(x + 1, y);
+          const D = at(x, y - 1), U = at(x, y + 1);
+          const gx = (R ?? c0) - (L ?? c0);
+          const gy = (U ?? c0) - (D ?? c0);
+          const gm = Math.hypot(gx, gy);
+          if (gm > 1e-9) { bx = -gx / gm; by = -gy / gm; }   // downhill = toward base
+        }
+
+        // Fall back to the discrete rule wherever the gradient is degenerate:
+        // a plateau, or a cell walled in on every side.
+        if (!bx && !by) {
+          for (const [dx, dy] of NEIGHBOURS) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const ni = ny * w + nx;
+            if (walls[ni]) continue;
+            if (dx && dy && (walls[y * w + nx] || walls[ny * w + x])) continue;
+            const c = cost[ni];
+            if (c < best) { best = c; bx = dx; by = dy; }
+          }
         }
 
         // An open cell with no downhill neighbour has nowhere to send anyone: the

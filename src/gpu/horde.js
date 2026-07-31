@@ -18,13 +18,14 @@ import {
   Fn, If, Return, Loop, instancedArray, uniform, uniformArray, atomicAdd, atomicLoad,
   atomicStore, texture, textureLoad, instanceIndex, float, int, uint, vec2, vec3,
   vec4, ivec2, length, max, min, abs, floor, mix, step, clamp, dot, sin, cos,
-  hash, positionGeometry, uv,
+  hash, positionGeometry, uv, mx_noise_float,
 } from 'three/tsl';
 
 import {
   MAX_ZOMBIES, SPAWN_BATCH, MAX_TURRETS, MAX_BLASTS, GRID_W, GRID_H,
   DENS_W, DENS_H, DENS_SCALE, CORPSE_FADE, BOUNTY_FLOOR,
-  BUCKET_K, ZOMBIE_RADIUS, STEER_ACCEL, TRAVEL_LIMIT, VISCOSITY, SUBSTEPS, ITERATIONS,
+  BUCKET_K, ZOMBIE_RADIUS, STEER_ACCEL, TRAVEL_LIMIT,
+  SWAY_RATE, SWAY_MAX, WANDER_SCALE, WANDER_DRIFT, WANDER_MAX, WANDER_CONE, VISCOSITY, SUBSTEPS, ITERATIONS,
   ZOMBIE_TYPES,
   BULLET_PIERCE_COST, BULLET_BLAST, BULLET_BLAST_MULT,
   MAX_BULLETS, MAX_MUZZLES, MUZZLE_BURST, BULLET_SPEED, BULLET_LIFE,
@@ -423,8 +424,28 @@ export class Horde {
       // noise, jam slowdown, wall drag) and they spent their time fighting each
       // other and the field, which is what made the crowd twitch.
       const f = flowAt(p).toVar();
-      const jit = d.z.sub(0.5).mul(0.25).toVar();     // tiny per-zombie heading bias
-      const cs = cos(jit).toVar(), sn = sin(jit).toVar();
+
+      // Heading perturbation, applied as a bounded ROTATION of the field
+      // direction rather than as a force added to it. This is the whole trick:
+      // an added force competes with the field and can cancel it, so a crowd
+      // stops arriving; a rotation clamped to WANDER_MAX cannot. A zombie always
+      // walks within that cone of the way home, so no amount of wander can stop
+      // it getting there, and pathing stays provably intact.
+      //
+      //   sway    per-zombie sine, phase from its seed. The individual wobble of
+      //           something that does not walk well.
+      //   wander  smooth noise over position AND time, so neighbours agree and
+      //           the crowd forms drifting streams rather than each body
+      //           twitching independently. Spatial coherence is what separates
+      //           this from just adding noise per zombie.
+      const phase = d.z.mul(6.2831853).toVar();
+      const sway = sin(u.time.mul(float(SWAY_RATE)).add(phase)).mul(float(SWAY_MAX)).toVar();
+      const wander = mx_noise_float(
+        vec3(p.mul(float(WANDER_SCALE)), u.time.mul(float(WANDER_DRIFT))),
+      ).mul(float(WANDER_MAX)).toVar();
+      const ang = clamp(sway.add(wander), float(-WANDER_CONE), float(WANDER_CONE)).toVar();
+
+      const cs = cos(ang).toVar(), sn = sin(ang).toVar();
       const dir = vec2(
         f.x.mul(cs).sub(f.y.mul(sn)),
         f.x.mul(sn).add(f.y.mul(cs)),

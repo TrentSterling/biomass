@@ -87,7 +87,12 @@ export const ZOMBIE_RADIUS = 0.22;          // half a shambler, for circle overl
 // It has to be a constant acceleration rather than a (want - v) controller:
 // contacts zero velocity every substep in a press, and a proportional controller
 // would only ever restore its own gain, leaving the whole horde crawling.
-export const STEER_ACCEL = 20;
+//
+// Lower means more momentum: at 7 a body takes about a seventh of a second to
+// reach walking pace and roughly a third of a second to reverse, so it banks
+// through turns instead of snapping to each new field direction. Push it much
+// below this and a crowd that contacts keep stalling starts to look sluggish.
+export const STEER_ACCEL = 7;
 
 // A body may not travel further than this fraction of its radius in one
 // substep, or it steps through the crowd in front of it before the solver ever
@@ -214,3 +219,23 @@ export const tierOf = (level) => (level <= 2 ? 0 : level <= 4 ? 1 : 2);
 export const SELL_REFUND = 0.6;
 
 export const BLAST_LIFE = 0.45;          // seconds a mortar blast applies damage
+
+
+// ---- heading perturbation ---------------------------------------------------
+// All of this rotates the flow direction; none of it is ever added to it as a
+// force. A rotation clamped to WANDER_CONE can never cancel the field, so the
+// crowd is guaranteed to keep arriving no matter how organic it looks.
+
+// Per-zombie sine wobble: the individual lurch of something that walks badly.
+export const SWAY_RATE = 2.2;                // radians per second
+export const SWAY_MAX = 0.20;                // ~11 degrees
+
+// Smooth noise over position and time. Sampling by POSITION is what makes
+// neighbours agree and the crowd break into drifting streams; noise per zombie
+// would just be twitch.
+export const WANDER_SCALE = 0.22;            // features about 4-5 world units across
+export const WANDER_DRIFT = 0.15;            // how fast the streams migrate
+export const WANDER_MAX = 0.34;              // ~19 degrees
+
+// Hard ceiling on the total deviation from the way home.
+export const WANDER_CONE = 0.45;             // ~26 degrees
