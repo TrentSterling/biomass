@@ -445,10 +445,16 @@ export class Horde {
               // behind it genuinely could not push through.
               If(other.notEqual(i).and(dat.element(other).x.greaterThan(0)), () => {
                 const q = pos.element(other).xy.toVar();
-                const rj = radiusOf(att.element(other)).toVar();
-                const minDist = ri.add(rj).toVar();
                 const delta = p.sub(q).toVar();
                 const dist = length(delta).toVar();
+                // Reject on the widest possible contact FIRST, using a constant,
+                // so the neighbour's attributes are only fetched for candidates
+                // that might actually touch. Reading them for every slot in the
+                // bucket cost a random access per candidate per iteration and
+                // took the ceiling from 964k bodies to 270k.
+                If(dist.lessThan(ri.add(float(ZOMBIE_RADIUS_MAX))), () => {
+                const rj = radiusOf(att.element(other)).toVar();
+                const minDist = ri.add(rj).toVar();
                 If(dist.lessThan(minDist), () => {
                   // Coincident pairs give a garbage normal. A stable per-pair
                   // direction separates them; noise just jitters them in place.
@@ -469,6 +475,7 @@ export class Horde {
                   const share = rj2.div(max(ri2.add(rj2), float(1e-6))).toVar();
                   push.addAssign(n.mul(minDist.sub(dist).mul(share)));
                   hits.addAssign(1);
+                });
                 });
               });
             });
@@ -551,10 +558,13 @@ export class Horde {
               // standstill.
               If(other.notEqual(i).and(dat.element(other).x.greaterThan(0)), () => {
                 const Q = pos.element(other).toVar();
+                const d2 = length(p.sub(Q.xy)).toVar();
+                If(d2.lessThan(ri.add(float(ZOMBIE_RADIUS_MAX)).mul(1.2)), () => {
                 const rad = ri.add(radiusOf(att.element(other))).mul(1.2).toVar();
-                If(length(p.sub(Q.xy)).lessThan(rad), () => {
+                If(d2.lessThan(rad), () => {
                   sum.addAssign(Q.zw);
                   n.addAssign(1);
+                });
                 });
               });
             });

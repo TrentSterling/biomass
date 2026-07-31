@@ -78,7 +78,10 @@ export const SPRITE_PX = 16;             // zombie sprite size in atlas
 // multiplier on shader size: 9 cells x BUCKET_K inlined bodies, twice over.
 // Raising it to 20 to cope with a one-unit cell dropped the sim to five frames
 // in eight seconds on register pressure alone. Keep the cell small instead.
-export const BUCKET_K = 12;
+// A half-unit cell holds 4.8 of the smallest body at hexagonal packing, so 10
+// is roughly double headroom. Every extra slot is 18 more inlined bodies of
+// shader across the two neighbour loops, so this is not free.
+export const BUCKET_K = 10;
 // Physics radius is DERIVED from the drawn scale, so a body collides at the size
 // it appears. These were divorced before: a bloater drew at 0.80 and collided at
 // 0.22 like everything else, so the big ones visibly overlapped each other.
