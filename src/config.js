@@ -221,9 +221,22 @@ export const BUILDS = [
 
 // Active abilities, the thing the original uses to survive density spikes.
 export const ABILITIES = [
+  // A plane flies in off the left edge along the clicked row and drops a
+  // stick of bombs centred on the clicked column -- always +x, regardless of
+  // local flow, so autoplay's fixed {1,0} dir reads exactly like a player
+  // click (see Build.fireAbility). Each bomb falls fallDelay seconds after
+  // the plane crosses its drop point, then hits through the shared blast
+  // system plus a short repel charge and ring, same detonation shape as
+  // bait/shockwave below.
+  //
+  // dps is tuned so the 6-bomb stick's total damage (dps * life * count)
+  // comes to about 1.3x the old 9-blast instant strike's total (3200 *
+  // ~1.0-avg-life * 9 = 28800): 7800 * 0.8 * 6 = 37440.
   {
     key: 'q', id: 'strike', name: 'AIRSTRIKE', cooldown: 14,
-    radius: 4.6, dps: 3200, life: 0.8, count: 9, spacing: 4.6, hitsPerSec: 900, stagger: 0.05,
+    radius: 4.6, dps: 7800, life: 0.8, count: 6, spacing: 2.4, hitsPerSec: 900,
+    planeSpeed: 40, fallDelay: 0.25,
+    repelAccel: -260, repelRadius: 4, repelLife: 0.1,
   },
   {
     key: 'e', id: 'nuke', name: 'NUKE', cooldown: 55,

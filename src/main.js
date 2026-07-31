@@ -477,11 +477,14 @@ function fireAbility(a) {
   const o = (cy * GRID_W + cx) * 4;
   const dir = { x: field.flow[o] / 255 * 2 - 1, y: field.flow[o + 1] / 255 * 2 - 1 };
   build.fireAbility(a, at, dir);
-  // Bait's own detonation blast plays sfx.blast() automatically through the
-  // tick-based delta check below (build.blasts.length growing), so this only
-  // needs to cover the sound of the ability actually landing.
+  // Every bomb's own detonation plays sfx.blast() automatically through the
+  // tick-based delta check below (build.blasts.length growing, once per
+  // landed bomb since they touch down a fraction of a second apart), same as
+  // bait's detonation -- so this only needs to cover the sound of the
+  // ability actually landing/launching.
   if (a.id === 'bait') sfx.ping();
   else if (a.id === 'shock') sfx.thump();
+  else if (a.id === 'strike') sfx.flyby();
   else sfx.blast();
   hud.toast(a.name);
 }
@@ -671,6 +674,7 @@ globalThis.__biomass = () => ({
   charges: charges.length, chargeCount: horde.u.chargeCount.value,
   chargeSample: charges[0] ? { x: +charges[0].x.toFixed(2), y: +charges[0].y.toFixed(2), accel: charges[0].accel, radius: charges[0].radius } : null,
   beacons: build.beacons.length, rings: build.rings.length,
+  planes: build.planes.length, fallingBombs: build.fallingBombs.length,
   spawnAt: { x: +field.spawns[0].x.toFixed(2), y: +field.spawns[0].y.toFixed(2) },
 });
 
@@ -923,7 +927,7 @@ function step(now) {
   // automated playtest finish a 12-wave run in well under a minute.
   for (let sub = 0; sub < simSpeed && !state.paused && !state.over; sub++) tick(dt);
 
-  effects.sync(build.turrets, build.segments, build.blasts, state.time, build.muzzleFlashes, build.rings, build.beacons);
+  effects.sync(build.turrets, build.segments, build.blasts, state.time, build.muzzleFlashes, build.rings, build.beacons, build.planes, build.fallingBombs);
   const b = BUILDS[state.selected];
   effects.setGhost(pointer.world, b, pointer.world ? build.valid(pointer.world, b) : false);
 

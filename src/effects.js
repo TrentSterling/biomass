@@ -4,9 +4,12 @@
 
 import * as THREE from 'three/webgpu';
 import { texture, uv, vec2 } from 'three/tsl';
-import { makeTurretAtlas, makeGlow, makeBeam, makeLevelStrip, TURRET_TILES, ACCENT } from './art.js';
+import { makeTurretAtlas, makeGlow, makeBeam, makeLevelStrip, makePlaneTexture, TURRET_TILES, ACCENT } from './art.js';
 
 const TURRET_SIZE = 2.7;
+// makePlaneTexture draws a 48x24 sprite (2:1, nose at +x): size the quad to
+// match that aspect so the nose doesn't squash or stretch.
+const PLANE_W = 4.4, PLANE_H = 2.2;
 // turret behaviour -> atlas tile (blades, emitter, emitter, mortar)
 // behaviour -> atlas column group; each group holds three tiers
 const GROUP_FOR_TYPE = [0, 1, 2, 3, 4];   // blades, beam, bounce, mortar, mg
@@ -74,6 +77,23 @@ export class Effects {
       blending: THREE.AdditiveBlending,
     });
 
+    // Airstrike plane: an alpha-cutout sprite (normal blend, not additive --
+    // it needs to read as a solid aircraft, not a light source) plus a soft
+    // drop shadow underneath it on the ground.
+    this.planeTex = makePlaneTexture();
+    this.planeMat = new THREE.MeshBasicNodeMaterial({
+      map: this.planeTex, transparent: true, alphaTest: 0.5, depthWrite: false,
+    });
+    this.planeShadowMat = new THREE.MeshBasicNodeMaterial({
+      color: 0x000000, transparent: true, opacity: 0.3, depthWrite: false,
+    });
+    // A falling bomb reads as a small dark silhouette dropping toward its
+    // landing point, distinct from the bright additive flash that plays once
+    // it actually detonates (see the blasts loop below).
+    this.bombMat = new THREE.MeshBasicNodeMaterial({
+      color: 0x1c1a16, transparent: true, opacity: 0.88, depthWrite: false,
+    });
+
     // one cutout material per level, same trick as the turret tiles
     this.levelTex = makeLevelStrip(6);
     this.levelMats = Array.from({ length: 6 }, (_, i) => {
@@ -94,6 +114,9 @@ export class Effects {
     this.zonePool = [];
     this.muzzlePool = [];
     this.beaconPool = [];
+    this.planePool = [];
+    this.planeShadowPool = [];
+    this.bombPool = [];
 
     // Reusable expanding-ring geometry: bait's detonation and the shockwave
     // both push {x,y,radius,life,life0} through the same pool below, so a
@@ -167,8 +190,9 @@ export class Effects {
   // `muzzles` is optional: {x,y,angle} for every gun turret that emitted a
   // round this frame. `rings` is optional: {x,y,radius,life,life0} expanding
   // shockwave rings. `beacons` is optional: {x,y,radius,until} pulsing bait
-  // markers.
-  sync(turrets, segments, blasts, time, muzzles = [], rings = [], beacons = []) {
+  // markers. `planes` is optional: {x,y} airstrike aircraft in flight.
+  // `fallingBombs` is optional: {x,y} ordnance released but not yet detonated.
+  sync(turrets, segments, blasts, time, muzzles = [], rings = [], beacons = [], planes = [], fallingBombs = []) {
     let ti = 0, bi = 0, gi = 0, zi = 0, li = 0, mi = 0;
 
     for (const t of turrets) {
@@ -286,6 +310,30 @@ export class Effects {
       ri++;
     }
 
+    // Airstrike planes: sprite drawn above everything, with a small offset
+    // drop shadow so it reads as flying rather than pasted on the ground.
+    // Always level (rotation 0) since a plane only ever flies +x.
+    let pi = 0;
+    for (const p of planes) {
+      const shadow = this.#at(this.planeShadowPool, pi, this.planeShadowMat);
+      shadow.position.set(p.x, p.y - 0.8, 0.9);
+      shadow.scale.set(PLANE_W, PLANE_H, 1);
+      const mesh = this.#at(this.planePool, pi, this.planeMat);
+      mesh.position.set(p.x, p.y, 0.97);
+      mesh.scale.set(PLANE_W, PLANE_H, 1);
+      pi++;
+    }
+
+    // Falling bombs: a small dark marker at the drop point until it detonates
+    // into a blast (drawn above by the blasts loop, once spawnBlast fires).
+    let fi = 0;
+    for (const fb of fallingBombs) {
+      const bomb = this.#at(this.bombPool, fi, this.bombMat);
+      bomb.position.set(fb.x, fb.y, 0.9);
+      bomb.scale.set(0.45, 0.45, 1);
+      fi++;
+    }
+
     this.#hideFrom(this.levelPool, li);
     this.#hideFrom(this.turretPool, ti);
     this.#hideFrom(this.beamPool, bi);
@@ -294,6 +342,9 @@ export class Effects {
     this.#hideFrom(this.muzzlePool, mi);
     this.#hideFrom(this.beaconPool, ki);
     this.#hideFrom(this.shockRingPool, ri);
+    this.#hideFrom(this.planePool, pi);
+    this.#hideFrom(this.planeShadowPool, pi);
+    this.#hideFrom(this.bombPool, fi);
   }
 
   setGhost(world, build, valid) {

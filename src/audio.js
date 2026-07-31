@@ -134,6 +134,34 @@ export const sfx = {
     tone({ freq: 740, type: 'sine', decay: 0.22, peak: 0.22, slideTo: 980 });
   },
 
+  // Airstrike inbound: a rising engine growl (bandpassed noise sweeping up
+  // in frequency, like a prop plane closing in) plus a rising low tone
+  // underneath. Distinct from blast()'s sharp crack -- the bombs' own
+  // detonations play that separately as each one lands.
+  flyby() {
+    if (!ctx) return;
+    const dur = 1.1;
+    const len = Math.max(1, Math.floor(ctx.sampleRate * dur));
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 6;
+    bp.frequency.setValueAtTime(220, now());
+    bp.frequency.exponentialRampToValueAtTime(1400, now() + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now());
+    g.gain.exponentialRampToValueAtTime(0.28, now() + dur * 0.6);
+    g.gain.exponentialRampToValueAtTime(0.0001, now() + dur);
+    src.connect(bp); bp.connect(g); g.connect(sfxGain);
+    src.start();
+    src.stop(now() + dur + 0.05);
+    tone({ freq: 140, type: 'sawtooth', decay: dur, peak: 0.18, slideTo: 260 });
+  },
+
   // Shockwave / a bait detonation's throw: a deep pressure thump, distinct
   // from blast()'s sharper crack so a repel reads differently from damage.
   thump() {

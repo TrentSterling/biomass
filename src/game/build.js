@@ -8,7 +8,7 @@
 //   bounce  -> one segment per reflection leg, zig-zagging off rock
 //   mortar  -> blasts, which are discs with a short life
 
-import { BUILDS, UPGRADE, tierOf, CELL_SCALE, RAMPART, RAMPART_HP, CHEW_DPS, TURRET_SIZE, BLAST_LIFE, MAX_BLASTS, MAX_TURRETS, MAX_BUILT, NO_BUILD_RADIUS, ABILITIES, SELL_REFUND } from '../config.js';
+import { BUILDS, UPGRADE, tierOf, CELL_SCALE, RAMPART, RAMPART_HP, CHEW_DPS, TURRET_SIZE, BLAST_LIFE, MAX_BLASTS, MAX_TURRETS, MAX_BUILT, NO_BUILD_RADIUS, ABILITIES, SELL_REFUND, GRID_W, GRID_H } from '../config.js';
 
 let nextId = 1;
 const BUILDS_WALL_COST = BUILDS.find((b) => b.kind === 'wall').cost;
@@ -39,9 +39,17 @@ export class Build {
     // gather-phase visual + the detonation payload; the GPU charge itself is
     // already running in horde.js the instant the beacon lands.
     this.beacons = [];
-    // Expanding shockwave ring visual, shared by bait's detonation and the
-    // instant shockwave: {x, y, radius, life, life0}.
+    // Expanding shockwave ring visual, shared by bait's detonation, the
+    // instant shockwave, and every airstrike bomb: {x, y, radius, life, life0}.
     this.rings = [];
+    // Airstrike aircraft in flight: {x, y, speed, drops[], next, a}. Owned
+    // here so Effects can draw them and Build.update can advance them, same
+    // as blasts/beacons above.
+    this.planes = [];
+    // Ordnance released by a plane, still mid-fall: {x, y, until, a}. Splits
+    // the drop (visual + timing) from the detonation (damage/repel/ring) the
+    // same way beacons split gather from blast.
+    this.fallingBombs = [];
     // (x, y, accel, radius, seconds) => void. Wired by main.js's charge
     // manager, which owns the array and writes the GPU uniform every frame;
     // this class only ever calls it to enqueue one, never touches the array.
@@ -59,6 +67,8 @@ export class Build {
     this.muzzleFlashes.length = 0;
     this.beacons.length = 0;
     this.rings.length = 0;
+    this.planes.length = 0;
+    this.fallingBombs.length = 0;
     this.counts = {};
     for (const id in this.cooldowns) this.cooldowns[id] = 0;
   }
@@ -84,6 +94,20 @@ export class Build {
     if (!this.abilityReady(a)) return false;
     this.cooldowns[a.id] = a.cooldown * (this.meta.cooldownMult ?? 1);
 
+    // AIRSTRIKE spawns a plane instead of an instant blast line: it flies in
+    // off the left edge along the clicked row and drops a stick of bombs
+    // centred on the clicked column as it crosses. Always +x regardless of
+    // `dir`, so autoplay's fixed {1,0} dir already reads correctly and this
+    // never needs the flow-aligned orientation the old blast line used.
+    if (a.id === 'strike') {
+      const count = a.count + (this.meta.strikeBombs ?? 0);
+      const first = at.x - ((count - 1) / 2) * a.spacing;
+      const drops = Array.from({ length: count }, (_, i) => first + i * a.spacing);
+      const y = Math.max(0.5, Math.min(GRID_H - 0.5, at.y));
+      this.planes.push({ x: -6, y, speed: a.planeSpeed, drops, next: 0, a });
+      return true;
+    }
+
     // BAIT and SHOCKWAVE are field-charge abilities: they push acceleration
     // into the crowd (see horde.js movePass) instead of the strike/nuke
     // blast-line shape below, so they branch off early.
@@ -103,18 +127,17 @@ export class Build {
       return true;
     }
 
-    const len = Math.hypot(dir.x, dir.y) || 1;
-    const ux = dir.x / len, uy = dir.y / len;
-    const count = a.count + (a.id === 'strike' ? (this.meta.strikeBombs ?? 0) : 0);
-    const radius = a.radius * (a.id === 'nuke' ? (this.meta.nukeRadius ?? 1) : 1);
-    const first = -((count - 1) / 2) * a.spacing;
-    for (let i = 0; i < count; i++) {
-      if (this.blasts.length >= MAX_BLASTS) break;
-      const d = first + i * a.spacing;
+    // Only NUKE reaches here now (strike/bait/shock all branch off above):
+    // one big blast, meta-scaled by nukeRadius. `dir` is unused since
+    // count/spacing are both 0 for a single blast, but the shape stays
+    // spawnBlast-free (matching the old code) so the MAX_BLASTS guard is
+    // explicit here rather than hidden in the helper.
+    const radius = a.radius * (this.meta.nukeRadius ?? 1);
+    if (this.blasts.length < MAX_BLASTS) {
       this.blasts.push({
-        x: at.x + ux * d, y: at.y + uy * d,
+        x: at.x, y: at.y,
         radius: radius * 0.4, full: radius,
-        dps: a.dps, life: a.life + i * (a.stagger ?? 0), life0: a.life + i * (a.stagger ?? 0),
+        dps: a.dps, life: a.life, life0: a.life,
         hitsPerSec: a.hitsPerSec ?? 1e6, tier: 1,
       });
     }
@@ -388,6 +411,33 @@ export class Build {
     for (let i = this.rings.length - 1; i >= 0; i--) {
       this.rings[i].life -= dt;
       if (this.rings[i].life <= 0) this.rings.splice(i, 1);
+    }
+
+    // AIRSTRIKE planes: fly +x at a steady speed, releasing a bomb (into
+    // fallingBombs, not an instant blast) every time the nose crosses one of
+    // its drop points. Despawns once it has cleared its whole stick and flown
+    // a bit further off the right edge.
+    for (let i = this.planes.length - 1; i >= 0; i--) {
+      const p = this.planes[i];
+      p.x += p.speed * dt;
+      while (p.next < p.drops.length && p.x >= p.drops[p.next]) {
+        this.fallingBombs.push({ x: p.drops[p.next], y: p.y, until: time + p.a.fallDelay, a: p.a });
+        p.next++;
+      }
+      if (p.next >= p.drops.length && p.x > p.drops[p.drops.length - 1] + GRID_W * 0.15) {
+        this.planes.splice(i, 1);
+      }
+    }
+    // Bombs that have finished falling detonate exactly like a bait/shock hit:
+    // damage through the shared blast system, a short hard repel, and a ring.
+    for (let i = this.fallingBombs.length - 1; i >= 0; i--) {
+      const fb = this.fallingBombs[i];
+      if (time < fb.until) continue;
+      this.fallingBombs.splice(i, 1);
+      const a = fb.a;
+      this.spawnBlast({ x: fb.x, y: fb.y, radius: a.radius, damage: a.dps * a.life, life: a.life, hitsPerSec: a.hitsPerSec, tier: 1 });
+      this.addCharge?.(fb.x, fb.y, a.repelAccel, a.repelRadius, a.repelLife);
+      this.rings.push({ x: fb.x, y: fb.y, radius: a.repelRadius + 2, life: 0.5, life0: 0.5 });
     }
 
     this.chewTimer -= dt;
