@@ -815,8 +815,12 @@ globalThis.__biomassCharge = (x, y, accel, radius, seconds) => {
 
 // Test hook: fire any ability at a point, ignoring its cooldown.
 globalThis.__biomassAbility = (name, x, y) => {
+  // 'airstrike' is what every human calls it; 'strike' is the internal id. The
+  // mismatch cost two rounds of "the plane never renders" debugging when the
+  // hook silently returned false, so both names work now.
+  if (name === 'airstrike') name = 'strike';
   const a = ABILITIES.find((ab) => ab.id === name);
-  if (!a) return false;
+  if (!a) { console.warn(`__biomassAbility: no ability '${name}'`); return false; }
   build.cooldowns[a.id] = 0;
   return build.fireAbility(a, { x, y }, { x: 1, y: 0 });
 };
