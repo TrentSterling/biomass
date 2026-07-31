@@ -10,8 +10,8 @@ const RUSH_BONUS_PER_SEC = 8;
 
 // The reference throws 100k+ zombies at you in its late waves, and difficulty comes
 // from bodies rather than from health bars. So the count grows hard and health
-// grows gently: wave 1 is about 1,100 zombies, wave 10 about 28,000, wave 16 about
-// 66,000, wave 20 about 100,000.
+// grows gently: wave 1 is about 1,100 zombies, wave 10 about 38,000, wave 16 about
+// 81,000, wave 20 about 118,000 (crawlers join at wave 2, husks at wave 4).
 export function composition(n) {
   const entries = [
     { type: 0, count: Math.round(300 + n * 600 + n * n * 220), dur: 11 },

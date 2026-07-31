@@ -3,7 +3,15 @@
 //
 // Authored maps. `waves` is not a guess: tools/playtest.mjs plays every map with
 // the baseline bot until it dies, and each target is set below that measured
-// ceiling. The spread from 12 to 40 is the difficulty ramp.
+// ceiling. The spread from 12 to 38 is the difficulty ramp.
+//
+// Recalibrated after crawlers/husks joined composition() (waves.js): that
+// stage raised headcount at every wave from 2 onward and was never checked
+// against these targets, so half the maps had drifted above their own
+// measured ceiling (tools/playtest.mjs, baseline bot: THE FORK 28/30, CHICANE
+// 25/34, THE COMB 22/36, THE FUNNEL 25/28, ISLANDS 25/26, THE SPIRAL 31/40 --
+// all LOSS). Targets below now carry a few waves of margin under the
+// re-measured ceiling rather than sitting flush against it.
 //
 // 24x14 characters, each character becomes a 4x4 block of sim
 // cells, so a one-character corridor is 4 units wide (roughly 8 zombies abreast).
@@ -38,7 +46,7 @@ export const MAPS = [
   },
   {
     name: 'THE FORK',
-    waves: 30,
+    waves: 26,
     built: 24,
     rows: [
       '########################',
@@ -103,7 +111,7 @@ export const MAPS = [
   },
   {
     name: 'CHICANE',
-    waves: 34,
+    waves: 23,
     built: 44,
     rows: [
       '########################',
@@ -124,7 +132,7 @@ export const MAPS = [
   },
   {
     name: 'THE COMB',
-    waves: 36,
+    waves: 20,
     rows: [
       '########################',
       '#S.....................#',
@@ -144,7 +152,7 @@ export const MAPS = [
   },
   {
     name: 'THE FUNNEL',
-    waves: 28,
+    waves: 23,
     rows: [
       '########################',
       '#S.....................#',
@@ -184,7 +192,7 @@ export const MAPS = [
   },
   {
     name: 'ISLANDS',
-    waves: 26,
+    waves: 24,
     rows: [
       '########################',
       '#..........S...........#',
@@ -244,7 +252,7 @@ export const MAPS = [
   },
   {
     name: 'THE SPIRAL',
-    waves: 40,
+    waves: 28,
     rows: [
       '########################',
       '#S.....................#',

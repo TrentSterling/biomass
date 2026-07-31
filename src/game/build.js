@@ -77,8 +77,19 @@ export class Build {
   // use. Centralised so the MAX_BLASTS cap check lives in one place: bait's
   // detonation and shockwave's instant hit both route through here instead of
   // duplicating the shape.
-  spawnBlast({ x, y, radius, damage, life, hitsPerSec = 1e6, tier = 1 }) {
-    if (this.blasts.length >= MAX_BLASTS) return false;
+  //
+  // `force` evicts the oldest blast to make room instead of dropping the new
+  // one. Routine mortar fire never sets it (a shell silently not landing is
+  // fine, there will be another one shortly), but a player-triggered ability
+  // is rare and cooldown-gated -- it always pairs its damage with a physical
+  // throw and a ring, so letting the damage half silently no-op under pool
+  // pressure while the throw/ring still fire would make the ability read as
+  // working when it did nothing.
+  spawnBlast({ x, y, radius, damage, life, hitsPerSec = 1e6, tier = 1 }, force = false) {
+    if (this.blasts.length >= MAX_BLASTS) {
+      if (!force) return false;
+      this.blasts.shift();
+    }
     const dps = damage / Math.max(life, 0.01);
     this.blasts.push({
       x, y, radius: radius * 0.4, full: radius,
@@ -121,7 +132,10 @@ export class Build {
       return true;
     }
     if (a.id === 'shock') {
-      this.spawnBlast({ x: at.x, y: at.y, radius: a.blastRadius, damage: a.blastDamage, life: a.blastLife, tier: 2 });
+      this.spawnBlast({ x: at.x, y: at.y, radius: a.blastRadius, damage: a.blastDamage, life: a.blastLife, tier: 2 }, true);
+      // The physical throw and its ring are cosmetic/kinematic, not damage --
+      // they fire regardless of whether the blast pool had room, so a full
+      // pool never turns an ability's push into a silent no-op.
       this.addCharge?.(at.x, at.y, a.repelAccel, a.repelRadius, a.repelLife);
       this.rings.push({ x: at.x, y: at.y, radius: a.repelRadius + 2, life: 0.5, life0: 0.5 });
       return true;
@@ -404,7 +418,7 @@ export class Build {
       const b = this.beacons[i];
       if (time < b.until) continue;
       this.beacons.splice(i, 1);
-      this.spawnBlast({ x: b.x, y: b.y, radius: b.blastRadius, damage: b.blastDamage, life: b.blastLife, tier: 2 });
+      this.spawnBlast({ x: b.x, y: b.y, radius: b.blastRadius, damage: b.blastDamage, life: b.blastLife, tier: 2 }, true);
       this.addCharge?.(b.x, b.y, b.repelAccel, b.repelRadius, b.repelLife);
       this.rings.push({ x: b.x, y: b.y, radius: b.repelRadius + 2, life: 0.5, life0: 0.5 });
     }
@@ -435,7 +449,7 @@ export class Build {
       if (time < fb.until) continue;
       this.fallingBombs.splice(i, 1);
       const a = fb.a;
-      this.spawnBlast({ x: fb.x, y: fb.y, radius: a.radius, damage: a.dps * a.life, life: a.life, hitsPerSec: a.hitsPerSec, tier: 1 });
+      this.spawnBlast({ x: fb.x, y: fb.y, radius: a.radius, damage: a.dps * a.life, life: a.life, hitsPerSec: a.hitsPerSec, tier: 1 }, true);
       this.addCharge?.(fb.x, fb.y, a.repelAccel, a.repelRadius, a.repelLife);
       this.rings.push({ x: fb.x, y: fb.y, radius: a.repelRadius + 2, life: 0.5, life0: 0.5 });
     }

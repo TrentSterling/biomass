@@ -673,7 +673,7 @@ export class Horde {
           const allowed = C.z.lessThanEqual(0).or(d.y.lessThan(4.5));
           If(allowed, () => {
             const falloff = float(1).sub(dist.div(max(C.w, float(0.001))));
-            const cdir = delta.div(max(dist, float(0.3)));
+            const cdir = delta.div(max(dist, float(1e-4)));
             v.addAssign(cdir.mul(C.z).mul(falloff).mul(u.h));
           });
         });
@@ -1048,7 +1048,14 @@ export class Horde {
     const dustT = clamp(bDeathAge.div(0.55), 0, 1);
     const dustFade = clamp(float(1).sub(dustT), 0, 1);
     const throwMul = mix(float(1), float(1.8), bDeton);      // detonations throw debris further
-    const deadSize = mix(float(0.55), mix(float(3.2), float(5.2), bDeton), dustT);
+    // Everything visible (dust + ring) is done by bDeathAge ~0.55s -- opacity
+    // above already clamps to 0 by then. Collapse the quad's own footprint to
+    // ~0 shortly after, so a dead slot that never gets reused (a quiet gun, or
+    // the tail end of a run) doesn't sit at a permanently oversized, fully
+    // rasterized-though-invisible extent for the rest of the run.
+    const settle = clamp(bDeathAge.sub(0.55).div(0.2), 0, 1);
+    const deadSize = mix(float(0.55), mix(float(3.2), float(5.2), bDeton), dustT)
+      .mul(float(1).sub(settle));
 
     const bSize = flySize.add(deadSize.mul(bDead));
     bMat.positionNode = vec3(bA.xy.add(positionGeometry.xy.mul(bSize)), 0.55);
