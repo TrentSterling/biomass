@@ -103,6 +103,7 @@ const flowDebug = new FlowOverlay(scene, field);
 const meta = metaEffects();
 const build = new Build(field, ground, horde, () => refreshField(), meta);
 build.onRampartLost = () => { hud.toast('a rampart has fallen'); sfx.leak(); };
+build.addCharge = addCharge;
 const waves = new Waves(field, horde);
 
 // A rebake rewrites field.flow in place, so the GPU just needs the upload flag.
@@ -148,6 +149,8 @@ async function resetRun() {
   refreshField();
   build.reset();
   waves.reset();
+  charges.length = 0;
+  horde.setCharges(charges);
   ap.cells = null;
   ap.cursor = 0;
   audioState.kills = 0;
@@ -444,6 +447,25 @@ function callWave() {
   return true;
 }
 
+// ---- physics charges (bait / shockwave) --------------------------------------
+// GPU acceleration fields abilities push into the crowd: an attract charge
+// gathers zombies toward a point, a repel charge throws them away from it.
+// Owned here, one array with one job (write the uniform snapshot each frame);
+// build.js only ever calls addCharge() to enqueue one and never touches the
+// list itself.
+const charges = [];   // {x, y, accel, radius, until}
+
+function addCharge(x, y, accel, radius, seconds) {
+  charges.push({ x, y, accel, radius, until: state.time + seconds });
+}
+
+function updateCharges() {
+  for (let i = charges.length - 1; i >= 0; i--) {
+    if (state.time >= charges[i].until) charges.splice(i, 1);
+  }
+  horde.setCharges(charges);
+}
+
 // Abilities fire at the cursor, along the local flow so an airstrike lands down
 // the lane the horde is walking rather than across it.
 function fireAbility(a) {
@@ -455,7 +477,12 @@ function fireAbility(a) {
   const o = (cy * GRID_W + cx) * 4;
   const dir = { x: field.flow[o] / 255 * 2 - 1, y: field.flow[o + 1] / 255 * 2 - 1 };
   build.fireAbility(a, at, dir);
-  sfx.blast();
+  // Bait's own detonation blast plays sfx.blast() automatically through the
+  // tick-based delta check below (build.blasts.length growing), so this only
+  // needs to cover the sound of the ability actually landing.
+  if (a.id === 'bait') sfx.ping();
+  else if (a.id === 'shock') sfx.thump();
+  else sfx.blast();
   hud.toast(a.name);
 }
 
@@ -641,6 +668,10 @@ globalThis.__biomass = () => ({
   hp: state.hp, over: state.over, won: state.won, sandbox: state.sandbox,
   wave: waves.wave, waveState: waves.state, target: TARGET_WAVES, speed: simSpeed,
   queued: horde._spawnQueue.length, lastError: globalThis.__biomassError ?? null,
+  charges: charges.length, chargeCount: horde.u.chargeCount.value,
+  chargeSample: charges[0] ? { x: +charges[0].x.toFixed(2), y: +charges[0].y.toFixed(2), accel: charges[0].accel, radius: charges[0].radius } : null,
+  beacons: build.beacons.length, rings: build.rings.length,
+  spawnAt: { x: +field.spawns[0].x.toFixed(2), y: +field.spawns[0].y.toFixed(2) },
 });
 
 // Jitter gauge. Reads the crowd buffer twice a second apart and compares the
@@ -767,6 +798,60 @@ globalThis.__biomassStuck = async (ms = 1500) => {
   };
 };
 
+// Test hook: fire a raw physics charge at a point, bypassing abilities and
+// cooldowns entirely. Positive accel attracts, negative repels.
+globalThis.__biomassCharge = (x, y, accel, radius, seconds) => {
+  addCharge(x, y, accel, radius, seconds);
+  return charges.length;
+};
+
+// Test hook: fire any ability at a point, ignoring its cooldown.
+globalThis.__biomassAbility = (name, x, y) => {
+  const a = ABILITIES.find((ab) => ab.id === name);
+  if (!a) return false;
+  build.cooldowns[a.id] = 0;
+  return build.fireAbility(a, { x, y }, { x: 1, y: 0 });
+};
+
+// Test hook: mean distance from every currently-alive zombie to a point.
+// Cheap and fine for a single reading, but NOT for comparing two readings
+// taken seconds apart in sandbox/bench mode: zombies constantly leak into the
+// base, and the ones that do are always the furthest-progressed (so the
+// furthest from a point near the middle of the map), which drags the mean of
+// whoever is left DOWN over time even with zero ability effect. See
+// __biomassSnapshot for the cohort-tracked version that controls for that.
+globalThis.__biomassMeanDist = async (x, y) => {
+  const posBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.pos.value));
+  const datBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.dat.value));
+  const n = Math.min(horde.used ?? 0, datBuf.length / 4);
+  let sum = 0, count = 0;
+  for (let i = 0; i < n; i++) {
+    if (datBuf[i * 4] <= 0) continue;
+    sum += Math.hypot(posBuf[i * 4] - x, posBuf[i * 4 + 1] - y);
+    count++;
+  }
+  return { count, mean: count ? sum / count : 0 };
+};
+
+// Test hook: raw per-slot alive flag + position for every slot that has ever
+// held a zombie. A caller wanting to measure a charge's effect on distance
+// over TIME should intersect the alive flags across several snapshots first
+// and only average over that fixed cohort -- comparing raw "mean distance of
+// whoever is alive right now" between two snapshots seconds apart is
+// dominated by leak-drain survivorship bias, not by the charge.
+globalThis.__biomassSnapshot = async () => {
+  const posBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.pos.value));
+  const datBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.dat.value));
+  const n = Math.min(horde.used ?? 0, datBuf.length / 4);
+  const alive = new Array(n), x = new Array(n), y = new Array(n);
+  for (let i = 0; i < n; i++) {
+    alive[i] = datBuf[i * 4] > 0 ? 1 : 0;
+    x[i] = posBuf[i * 4];
+    y[i] = posBuf[i * 4 + 1];
+  }
+  return { n, alive, x, y };
+};
+
 globalThis.__biomassSolver = (substeps, iterations) => {
   if (substeps) horde.substeps = substeps;
   if (iterations) horde.iterations = iterations;
@@ -838,7 +923,7 @@ function step(now) {
   // automated playtest finish a 12-wave run in well under a minute.
   for (let sub = 0; sub < simSpeed && !state.paused && !state.over; sub++) tick(dt);
 
-  effects.sync(build.turrets, build.segments, build.blasts, state.time, build.muzzleFlashes);
+  effects.sync(build.turrets, build.segments, build.blasts, state.time, build.muzzleFlashes, build.rings, build.beacons);
   const b = BUILDS[state.selected];
   effects.setGhost(pointer.world, b, pointer.world ? build.valid(pointer.world, b) : false);
 
@@ -884,6 +969,7 @@ function tick(dt) {
       waves.update(dt);
     }
     build.update(dt, state.time);
+    updateCharges();
     horde.update(dt, state.time);
 
     state.gold += horde.takeGold();

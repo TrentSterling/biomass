@@ -61,6 +61,12 @@ export class Effects {
       map: this.glowTex, transparent: true, depthWrite: false, opacity: 0.85,
       blending: THREE.AdditiveBlending,
     });
+    // Bait beacon: a pulsing lure marker, tinted apart from the warm
+    // blast/turret palette so "gathering" reads differently from "damage".
+    this.beaconMat = new THREE.MeshBasicNodeMaterial({
+      map: this.glowTex, color: 0xc9a6ff, transparent: true, depthWrite: false, opacity: 0.6,
+      blending: THREE.AdditiveBlending,
+    });
     // Dim wash drawn at the true damage diameter, so the blade turret's kill
     // zone is the thing you see rather than a small glow inside a big radius.
     this.zoneMat = new THREE.MeshBasicNodeMaterial({
@@ -87,6 +93,19 @@ export class Effects {
     this.glowPool = [];
     this.zonePool = [];
     this.muzzlePool = [];
+    this.beaconPool = [];
+
+    // Reusable expanding-ring geometry: bait's detonation and the shockwave
+    // both push {x,y,radius,life,life0} through the same pool below, so a
+    // repel always reads on screen the same way regardless of which ability
+    // threw it.
+    this.ringGeo = new THREE.BufferGeometry().setFromPoints(
+      Array.from({ length: 49 }, (_, i) => {
+        const a = (i / 48) * Math.PI * 2;
+        return new THREE.Vector3(Math.cos(a), Math.sin(a), 0);
+      }),
+    );
+    this.shockRingPool = [];
 
     // build ghost: a tinted block plus a range ring
     this.ghost = new THREE.Mesh(this.quad, new THREE.MeshBasicNodeMaterial({
@@ -126,11 +145,30 @@ export class Effects {
 
   #hideFrom(pool, n) { for (let i = n; i < pool.length; i++) pool[i].visible = false; }
 
+  // A Line, not a Mesh, so it needs its own tiny pool helper: #at() above
+  // assumes a shared material per slot, but every ring fades independently.
+  #ringAt(i) {
+    let mesh = this.shockRingPool[i];
+    if (!mesh) {
+      mesh = new THREE.Line(this.ringGeo, new THREE.LineBasicMaterial({
+        color: 0xbfe6ff, transparent: true, opacity: 0, depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }));
+      mesh.frustumCulled = false;
+      this.shockRingPool[i] = mesh;
+      this.scene.add(mesh);
+    }
+    mesh.visible = true;
+    return mesh;
+  }
+
   // `segments` are flat {x0,y0,x1,y1,width,hot,tier} beams: one for a locked
   // beam, one per leg for a bouncing one. The renderer does not care which.
   // `muzzles` is optional: {x,y,angle} for every gun turret that emitted a
-  // round this frame.
-  sync(turrets, segments, blasts, time, muzzles = []) {
+  // round this frame. `rings` is optional: {x,y,radius,life,life0} expanding
+  // shockwave rings. `beacons` is optional: {x,y,radius,until} pulsing bait
+  // markers.
+  sync(turrets, segments, blasts, time, muzzles = [], rings = [], beacons = []) {
     let ti = 0, bi = 0, gi = 0, zi = 0, li = 0, mi = 0;
 
     for (const t of turrets) {
@@ -221,12 +259,41 @@ export class Effects {
       mi++;
     }
 
+    // Bait beacons: a pulsing lure marker for as long as the gather charge is
+    // live. Purely cosmetic -- the GPU charge is already running the instant
+    // the beacon is pushed.
+    let ki = 0;
+    for (const b of beacons) {
+      const mesh = this.#at(this.beaconPool, ki, this.beaconMat);
+      mesh.position.set(b.x, b.y, 0.58);
+      const pulse = 0.7 + 0.3 * Math.abs(Math.sin(time * 9 + b.x));
+      const s = b.radius * 0.7 * pulse;
+      mesh.scale.set(s, s, 1);
+      ki++;
+    }
+
+    // Expanding shockwave rings: shared by bait's detonation and the instant
+    // shockwave. life counts down from life0, so k runs 0 (just fired) -> 1
+    // (about to be culled).
+    let ri = 0;
+    for (const r of rings) {
+      const k = 1 - Math.max(0, r.life) / (r.life0 || 0.5);
+      const mesh = this.#ringAt(ri);
+      mesh.position.set(r.x, r.y, 0.72);
+      const s = Math.max(0.05, r.radius * (0.15 + 0.85 * k));
+      mesh.scale.set(s, s, 1);
+      mesh.material.opacity = 0.7 * (1 - k);
+      ri++;
+    }
+
     this.#hideFrom(this.levelPool, li);
     this.#hideFrom(this.turretPool, ti);
     this.#hideFrom(this.beamPool, bi);
     this.#hideFrom(this.glowPool, gi);
     this.#hideFrom(this.zonePool, zi);
     this.#hideFrom(this.muzzlePool, mi);
+    this.#hideFrom(this.beaconPool, ki);
+    this.#hideFrom(this.shockRingPool, ri);
   }
 
   setGhost(world, build, valid) {

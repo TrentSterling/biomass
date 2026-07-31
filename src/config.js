@@ -49,6 +49,10 @@ export const SPAWN_BATCH = 2048;         // hard cap on zombies spawned in one f
 // than a turret budget.
 export const MAX_TURRETS = 256;
 export const MAX_BLASTS = 48;
+// Physics charges: acceleration fields abilities push into the crowd (bait
+// attract, shockwave repel). A handful active at once is the realistic
+// ceiling, so this is generous headroom, not a tuning knob.
+export const MAX_CHARGES = 8;
 
 // A round pierces until its life runs out, then detonates. Each hit costs life,
 // so the pierce budget and the range are the same number.
@@ -224,6 +228,32 @@ export const ABILITIES = [
   {
     key: 'e', id: 'nuke', name: 'NUKE', cooldown: 55,
     radius: 15.0, dps: 9000, life: 1.1, count: 1, spacing: 0, hitsPerSec: 6000,
+  },
+  // Field-charge abilities: gather-then-throw and pure-throw. These push
+  // acceleration into the crowd (see horde.js movePass) instead of firing the
+  // strike/nuke blast-line shape above, so they carry their own field names
+  // (attract*/repel*/blast*) rather than count/spacing/stagger.
+  {
+    key: 'b', id: 'bait', name: 'BAIT BOMB', cooldown: 25,
+    // Gathers for attractLife seconds, then detonates: damage through the
+    // shared blast system plus a hard repel charge that throws whatever it
+    // gathered outward.
+    // 70 was the initial number and measured out too weak to move the horde at
+    // all against its own walking/spawn dynamics (confirmed with an A/B
+    // control test: no detectable convergence over the whole attract window).
+    // A raw charge test at accel 300 collapsed a cluster to near-zero spread
+    // within 1s -- 150 sits well clear of ordinary steering (maxSpeed *
+    // STEER_ACCEL tops out around 52 for the fastest type) while still taking
+    // a visible couple of seconds to pull a crowd in, not teleporting it.
+    attractAccel: 150, attractRadius: 7, attractLife: 2.6,
+    blastRadius: 5.5, blastDamage: 240, blastLife: 0.35,
+    repelAccel: -520, repelRadius: 8, repelLife: 0.15,
+  },
+  {
+    key: 's', id: 'shock', name: 'SHOCKWAVE', cooldown: 12,
+    // Instant repel, no gather phase: a physical blast, not a lure.
+    repelAccel: -400, repelRadius: 7, repelLife: 0.18,
+    blastRadius: 6, blastDamage: 35, blastLife: 0.25,
   },
 ];
 

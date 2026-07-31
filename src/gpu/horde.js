@@ -24,7 +24,7 @@ import {
 import { TILE_COUNT } from '../art.js';
 
 import {
-  MAX_ZOMBIES, SPAWN_BATCH, MAX_TURRETS, MAX_BLASTS, GRID_W, GRID_H,
+  MAX_ZOMBIES, SPAWN_BATCH, MAX_TURRETS, MAX_BLASTS, MAX_CHARGES, GRID_W, GRID_H,
   DENS_W, DENS_H, DENS_SCALE, CORPSE_FADE, BOUNTY_FLOOR,
   BUCKET_K, ZOMBIE_RADIUS, ZOMBIE_RADIUS_MAX, SPRITE_PER_RADIUS, SIZE_JITTER, zombieRadius,
   STEER_ACCEL, TRAVEL_LIMIT,
@@ -112,6 +112,7 @@ export class Horde {
       bulletDamage: uniform(25),
       bulletSpread: uniform(0.1),
       muzzleCount: uniform(0, 'int'),
+      chargeCount: uniform(0, 'int'),
     };
     this.u = u;
 
@@ -124,6 +125,11 @@ export class Horde {
     this.blastCaps = uniformArray(Array.from({ length: MAX_BLASTS }, () => new THREE.Vector4()), 'vec4');
     // x, y, angle, rounds to emit this frame
     this.muzzles = uniformArray(Array.from({ length: MAX_MUZZLES }, () => new THREE.Vector4()), 'vec4');
+    // x, y, accel, radius. Positive accel attracts (bait), negative repels
+    // (shockwave / a bait detonation's throw). Uniforms, like every other
+    // per-shape list here, so a handful of active charges cost nothing extra
+    // against the 8-storage-buffer budget.
+    this.chargeA = uniformArray(Array.from({ length: MAX_CHARGES }, () => new THREE.Vector4()), 'vec4');
 
     // ---- shared shader helpers --------------------------------------------
     const flowTex = texture(flowTexture);
@@ -646,6 +652,33 @@ export class Horde {
       const sp = length(v).add(1e-5).toVar();
       If(sp.greaterThan(maxSpeed), () => { v.mulAssign(maxSpeed.div(sp)); });
 
+      // ---- field charges: bait / shockwave ---------------------------------
+      // Deliberate exception to "the flow field always wins" above: a charge is
+      // a player VERB whose entire job is to out-shout the field for a moment,
+      // bounded in both radius and time so it can never become a second,
+      // permanent router. Landing here -- after the walk-speed clamp but
+      // before the travel-limit cap below -- is the whole trick: a detonation
+      // can throw a body faster than it could ever walk on its own, while the
+      // travel cap still stops that throw from tunnelling it through the crowd
+      // or a wall in one substep.
+      Loop(u.chargeCount, ({ i: ci }) => {
+        const C = this.chargeA.element(ci).toVar();     // x, y, accel, radius
+        const delta = C.xy.sub(p).toVar();
+        const dist = length(delta).toVar();
+        If(dist.lessThan(C.w), () => {
+          // Repel (accel < 0) is a physical blast: it throws everyone. Attract
+          // (accel > 0) is a lure, and bait does not fool a human -- gate it to
+          // types below 4.5 so the survivors arriving in a later stage walk
+          // past a beacon untouched.
+          const allowed = C.z.lessThanEqual(0).or(d.y.lessThan(4.5));
+          If(allowed, () => {
+            const falloff = float(1).sub(dist.div(max(C.w, float(0.001))));
+            const cdir = delta.div(max(dist, float(0.3)));
+            v.addAssign(cdir.mul(C.z).mul(falloff).mul(u.h));
+          });
+        });
+      });
+
       // Discretisation speed limit: never travel more than a fraction of a body
       // radius in one substep, or a body steps through the crowd in front of it
       // before the solver ever sees the contact.
@@ -1121,6 +1154,7 @@ export class Horde {
     this.density = new Uint32Array(DENS_W * DENS_H);
     this.u.turretCount.value = 0;
     this.u.blastCount.value = 0;
+    this.u.chargeCount.value = 0;
     this.initPass.count = MAX_ZOMBIES;
     this._muzzleCount = 0;
     this._bulletCursor = 0;
@@ -1356,5 +1390,18 @@ export class Horde {
       this.blastCaps.array[i].set(b.cap ?? 1e9, 0, 0, 0);
     }
     this.u.blastCount.value = n;
+  }
+
+  // Physics charges: {x, y, accel, radius}. Positive accel attracts (bait),
+  // negative repels (shockwave, and a bait detonation's throw). Owned
+  // frame-to-frame by main.js's charge manager; this just uploads the
+  // uniform snapshot, same shape as setWeapons/setBlasts above.
+  setCharges(list) {
+    const n = Math.min(list.length, MAX_CHARGES);
+    for (let i = 0; i < n; i++) {
+      const c = list[i];
+      this.chargeA.array[i].set(c.x, c.y, c.accel, c.radius);
+    }
+    this.u.chargeCount.value = n;
   }
 }

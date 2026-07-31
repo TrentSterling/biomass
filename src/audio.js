@@ -129,6 +129,18 @@ export const sfx = {
     tone({ freq: 90, type: 'sine', decay: 0.4, peak: 0.4, slideTo: 34 });
   },
 
+  // Bait bomb landing: a soft, hopeful little chirp, not a threat sound.
+  ping() {
+    tone({ freq: 740, type: 'sine', decay: 0.22, peak: 0.22, slideTo: 980 });
+  },
+
+  // Shockwave / a bait detonation's throw: a deep pressure thump, distinct
+  // from blast()'s sharper crack so a repel reads differently from damage.
+  thump() {
+    tone({ freq: 60, type: 'sine', decay: 0.3, peak: 0.5, slideTo: 28 });
+    noiseBurst({ decay: 0.28, peak: 0.3, lowpass: 400 });
+  },
+
   leak() {
     tone({ freq: 70, type: 'square', decay: 0.32, peak: 0.4, slideTo: 44 });
     noiseBurst({ decay: 0.22, peak: 0.2, lowpass: 500 });

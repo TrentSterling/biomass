@@ -35,7 +35,19 @@ export class Build {
     this.blasts = [];
     this.segments = [];        // what Effects draws
     this.muzzleFlashes = [];   // {x,y,angle} for gun turrets that fired this frame
-    this.counts = {};          // per-build purchases, for price escalation
+    // Pulsing bait markers: {x, y, radius, until, blast*, repel*}. Purely a
+    // gather-phase visual + the detonation payload; the GPU charge itself is
+    // already running in horde.js the instant the beacon lands.
+    this.beacons = [];
+    // Expanding shockwave ring visual, shared by bait's detonation and the
+    // instant shockwave: {x, y, radius, life, life0}.
+    this.rings = [];
+    // (x, y, accel, radius, seconds) => void. Wired by main.js's charge
+    // manager, which owns the array and writes the GPU uniform every frame;
+    // this class only ever calls it to enqueue one, never touches the array.
+    this.addCharge = null;
+    this._now = 0;
+    this.counts = {};           // per-build purchases, for price escalation
     this.cooldowns = Object.fromEntries(ABILITIES.map((a) => [a.id, 0]));
   }
 
@@ -45,8 +57,24 @@ export class Build {
     this.blasts.length = 0;
     this.segments.length = 0;
     this.muzzleFlashes.length = 0;
+    this.beacons.length = 0;
+    this.rings.length = 0;
     this.counts = {};
     for (const id in this.cooldowns) this.cooldowns[id] = 0;
+  }
+
+  // A flat damage disc, the same shape mortars and the strike/nuke blast-line
+  // use. Centralised so the MAX_BLASTS cap check lives in one place: bait's
+  // detonation and shockwave's instant hit both route through here instead of
+  // duplicating the shape.
+  spawnBlast({ x, y, radius, damage, life, hitsPerSec = 1e6, tier = 1 }) {
+    if (this.blasts.length >= MAX_BLASTS) return false;
+    const dps = damage / Math.max(life, 0.01);
+    this.blasts.push({
+      x, y, radius: radius * 0.4, full: radius,
+      dps, life, life0: life, hitsPerSec, tier,
+    });
+    return true;
   }
 
   // ---- active abilities -----------------------------------------------------
@@ -55,6 +83,26 @@ export class Build {
   fireAbility(a, at, dir = { x: 1, y: 0 }) {
     if (!this.abilityReady(a)) return false;
     this.cooldowns[a.id] = a.cooldown * (this.meta.cooldownMult ?? 1);
+
+    // BAIT and SHOCKWAVE are field-charge abilities: they push acceleration
+    // into the crowd (see horde.js movePass) instead of the strike/nuke
+    // blast-line shape below, so they branch off early.
+    if (a.id === 'bait') {
+      this.beacons.push({
+        x: at.x, y: at.y, radius: a.attractRadius, until: this._now + a.attractLife,
+        blastRadius: a.blastRadius, blastDamage: a.blastDamage, blastLife: a.blastLife,
+        repelAccel: a.repelAccel, repelRadius: a.repelRadius, repelLife: a.repelLife,
+      });
+      this.addCharge?.(at.x, at.y, a.attractAccel, a.attractRadius, a.attractLife);
+      return true;
+    }
+    if (a.id === 'shock') {
+      this.spawnBlast({ x: at.x, y: at.y, radius: a.blastRadius, damage: a.blastDamage, life: a.blastLife, tier: 2 });
+      this.addCharge?.(at.x, at.y, a.repelAccel, a.repelRadius, a.repelLife);
+      this.rings.push({ x: at.x, y: at.y, radius: a.repelRadius + 2, life: 0.5, life0: 0.5 });
+      return true;
+    }
+
     const len = Math.hypot(dir.x, dir.y) || 1;
     const ux = dir.x / len, uy = dir.y / len;
     const count = a.count + (a.id === 'strike' ? (this.meta.strikeBombs ?? 0) : 0);
@@ -323,7 +371,25 @@ export class Build {
   }
 
   update(dt, time) {
+    this._now = time;
     for (const id in this.cooldowns) this.cooldowns[id] = Math.max(0, this.cooldowns[id] - dt);
+
+    // BAIT beacons: gather for attractLife seconds, then detonate -- damage
+    // through the shared blast system plus a hard repel charge that throws
+    // whatever it gathered, and a ring so the throw reads on screen.
+    for (let i = this.beacons.length - 1; i >= 0; i--) {
+      const b = this.beacons[i];
+      if (time < b.until) continue;
+      this.beacons.splice(i, 1);
+      this.spawnBlast({ x: b.x, y: b.y, radius: b.blastRadius, damage: b.blastDamage, life: b.blastLife, tier: 2 });
+      this.addCharge?.(b.x, b.y, b.repelAccel, b.repelRadius, b.repelLife);
+      this.rings.push({ x: b.x, y: b.y, radius: b.repelRadius + 2, life: 0.5, life0: 0.5 });
+    }
+    for (let i = this.rings.length - 1; i >= 0; i--) {
+      this.rings[i].life -= dt;
+      if (this.rings[i].life <= 0) this.rings.splice(i, 1);
+    }
+
     this.chewTimer -= dt;
     if (this.chewTimer <= 0) {
       this.#chewRamparts(0.25);
