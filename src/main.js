@@ -838,7 +838,7 @@ function step(now) {
   // automated playtest finish a 12-wave run in well under a minute.
   for (let sub = 0; sub < simSpeed && !state.paused && !state.over; sub++) tick(dt);
 
-  effects.sync(build.turrets, build.segments, build.blasts, state.time);
+  effects.sync(build.turrets, build.segments, build.blasts, state.time, build.muzzleFlashes);
   const b = BUILDS[state.selected];
   effects.setGhost(pointer.world, b, pointer.world ? build.valid(pointer.world, b) : false);
 

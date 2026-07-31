@@ -34,6 +34,7 @@ export class Build {
     this.turrets = [];
     this.blasts = [];
     this.segments = [];        // what Effects draws
+    this.muzzleFlashes = [];   // {x,y,angle} for gun turrets that fired this frame
     this.counts = {};          // per-build purchases, for price escalation
     this.cooldowns = Object.fromEntries(ABILITIES.map((a) => [a.id, 0]));
   }
@@ -43,6 +44,7 @@ export class Build {
     this.turrets.length = 0;
     this.blasts.length = 0;
     this.segments.length = 0;
+    this.muzzleFlashes.length = 0;
     this.counts = {};
     for (const id in this.cooldowns) this.cooldowns[id] = 0;
   }
@@ -312,7 +314,10 @@ export class Build {
       damage = t.damage;
       spread = t.spread;
       tier = Math.max(tier, t.tier ?? 0);
-      if (rounds > 0 && out.length < 16) out.push({ x: t.x, y: t.y, angle: t.angle, rounds });
+      if (rounds > 0 && out.length < 16) {
+        out.push({ x: t.x, y: t.y, angle: t.angle, rounds });
+        this.muzzleFlashes.push({ x: t.x, y: t.y, angle: t.angle });
+      }
     }
     this.horde.setMuzzles(out, damage, spread, tier);
   }
@@ -326,6 +331,7 @@ export class Build {
     }
     const weapons = [];
     this.segments.length = 0;
+    this.muzzleFlashes.length = 0;
 
     for (const t of this.turrets) {
       if (t.type === 0) {

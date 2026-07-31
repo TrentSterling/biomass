@@ -4,14 +4,15 @@
 
 import * as THREE from 'three/webgpu';
 import { texture, uv, vec2 } from 'three/tsl';
-import { makeTurretAtlas, makeGlow, makeBeam, makeLevelStrip, TURRET_TILES } from './art.js';
+import { makeTurretAtlas, makeGlow, makeBeam, makeLevelStrip, TURRET_TILES, ACCENT } from './art.js';
 
 const TURRET_SIZE = 2.7;
 // turret behaviour -> atlas tile (blades, emitter, emitter, mortar)
 // behaviour -> atlas column group; each group holds three tiers
 const GROUP_FOR_TYPE = [0, 1, 2, 3, 4];   // blades, beam, bounce, mortar, mg
-// tier -> beam/glow colour, matching the sprite accents
-const TIER_BEAM = [0xffd27a, 0xe08cff, 0x8ef2ff];
+// tier -> beam/glow colour: the same accent ramp the turret sprites use, so a
+// beam and the turret firing it always agree on tier colour.
+const TIER_BEAM = ACCENT;
 
 export class Effects {
   constructor(scene) {
@@ -45,6 +46,21 @@ export class Effects {
       map: this.glowTex, transparent: true, depthWrite: false, opacity: 0.5,
       blending: THREE.AdditiveBlending,
     });
+    // Node flash: the round bloom drawn at a beam/bounce segment's landing
+    // point. Tier-tinted and sized off the beam's own width (see sync()) so a
+    // bounce turret's bend reads as one continuous hot joint, not a beam that
+    // stops and a differently-coloured glow that starts.
+    this.nodeMats = TIER_BEAM.map((color) => new THREE.MeshBasicNodeMaterial({
+      map: this.glowTex, color, transparent: true, depthWrite: false, opacity: 0.6,
+      blending: THREE.AdditiveBlending,
+    }));
+    // Muzzle flash: a tiny flick at the barrel on frames a gun turret emits
+    // rounds. Reuses the generic glow texture untinted (rounds have no tier
+    // colour of their own).
+    this.muzzleMat = new THREE.MeshBasicNodeMaterial({
+      map: this.glowTex, transparent: true, depthWrite: false, opacity: 0.85,
+      blending: THREE.AdditiveBlending,
+    });
     // Dim wash drawn at the true damage diameter, so the blade turret's kill
     // zone is the thing you see rather than a small glow inside a big radius.
     this.zoneMat = new THREE.MeshBasicNodeMaterial({
@@ -70,6 +86,7 @@ export class Effects {
     this.beamPool = [];
     this.glowPool = [];
     this.zonePool = [];
+    this.muzzlePool = [];
 
     // build ghost: a tinted block plus a range ring
     this.ghost = new THREE.Mesh(this.quad, new THREE.MeshBasicNodeMaterial({
@@ -109,10 +126,12 @@ export class Effects {
 
   #hideFrom(pool, n) { for (let i = n; i < pool.length; i++) pool[i].visible = false; }
 
-  // `segments` are flat {x0,y0,x1,y1,width,hot} beams: one for a locked beam,
-  // one per leg for a bouncing one. The renderer does not care which.
-  sync(turrets, segments, blasts, time) {
-    let ti = 0, bi = 0, gi = 0, zi = 0, li = 0;
+  // `segments` are flat {x0,y0,x1,y1,width,hot,tier} beams: one for a locked
+  // beam, one per leg for a bouncing one. The renderer does not care which.
+  // `muzzles` is optional: {x,y,angle} for every gun turret that emitted a
+  // round this frame.
+  sync(turrets, segments, blasts, time, muzzles = []) {
+    let ti = 0, bi = 0, gi = 0, zi = 0, li = 0, mi = 0;
 
     for (const t of turrets) {
       const tier = Math.min(2, t.tier ?? 0);
@@ -161,10 +180,11 @@ export class Effects {
       const ang = Math.atan2(dy, dx);
       // wide soft body plus a thin hot core, so a beam looks like it is cutting
       const st = Math.min(2, s.tier ?? 0);
+      const bodyW = Math.max(1.2, s.width * 3.6 * hot);
       const body = this.#at(this.beamPool, bi, this.beamMats[st]);
       body.position.set(s.x0 + dx / 2, s.y0 + dy / 2, 0.6);
       body.material = this.beamMats[st];
-      body.scale.set(len, Math.max(1.2, s.width * 3.6 * hot), 1);
+      body.scale.set(len, bodyW, 1);
       body.rotation.z = ang;
       bi++;
       const core = this.#at(this.beamPool, bi, this.coreMats[st]);
@@ -173,11 +193,14 @@ export class Effects {
       core.scale.set(len, Math.max(0.5, s.width * 1.5) * (0.85 + Math.sin(time * 30 + s.x0) * 0.15), 1);
       core.rotation.z = ang;
       bi++;
-      // bloom where the leg lands, so a reflection reads as a hit
-      const impact = this.#at(this.glowPool, gi, this.glowMat);
+      // bloom where the leg lands, sized off the beam's own full body width and
+      // tier-tinted to match it, so a bounce turret's bend reads as one
+      // continuous hot joint rather than a beam handing off to a generic flash.
+      const impact = this.#at(this.glowPool, gi, this.nodeMats[st]);
+      impact.material = this.nodeMats[st];
       impact.position.set(s.x1, s.y1, 0.66);
-      const hs = (1.5 + Math.sin(time * 26 + s.x0) * 0.3) * hot;
-      impact.scale.set(hs, hs, 1);
+      const ns = bodyW * 1.6 * (0.9 + Math.sin(time * 26 + s.x0) * 0.12) * hot;
+      impact.scale.set(ns, ns, 1);
       gi++;
     }
 
@@ -189,11 +212,21 @@ export class Effects {
       gi++;
     }
 
+    // Muzzle flash: a small flick at the barrel, only present on frames a gun
+    // actually emitted rounds - the caller already only sends live entries.
+    for (const m of muzzles) {
+      const flash = this.#at(this.muzzlePool, mi, this.muzzleMat);
+      flash.position.set(m.x + Math.cos(m.angle) * 1.7, m.y + Math.sin(m.angle) * 1.7, 0.68);
+      flash.scale.set(0.9, 0.9, 1);
+      mi++;
+    }
+
     this.#hideFrom(this.levelPool, li);
     this.#hideFrom(this.turretPool, ti);
     this.#hideFrom(this.beamPool, bi);
     this.#hideFrom(this.glowPool, gi);
     this.#hideFrom(this.zonePool, zi);
+    this.#hideFrom(this.muzzlePool, mi);
   }
 
   setGhost(world, build, valid) {

@@ -273,7 +273,10 @@ const CHASSIS = [
   { ring: '#1d2733', body: '#7d8ea3', core: '#28394d' },   // tier 2, alloy
 ];
 
-const ACCENT = ['#e8c33c', '#d770ff', '#7ef0ff'];          // gold, violet, plasma
+// tier -> accent colour (gold, violet, plasma), shared with beams/node
+// flashes in effects.js so an upgraded turret's sprite and its weapon read as
+// the same object.
+export const ACCENT = ['#e8c33c', '#d770ff', '#7ef0ff'];
 
 export function makeTurretAtlas() {
   const S = 32;

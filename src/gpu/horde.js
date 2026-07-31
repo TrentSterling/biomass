@@ -892,7 +892,21 @@ export class Horde {
             }
           }
         });
-        bullets.element(instanceIndex).assign(vec4(p1, B.z, max(life, float(0))));
+
+        // A dead round keeps its vec4 slot (no free-list, same as everywhere
+        // else in the horde) but repurposes it: the angle in .z is dead weight
+        // once nothing is steering, so it becomes the death timestamp, and .w
+        // swaps from "life remaining" (always >= 0 while flying) to a negative
+        // kind flag so the render side can tell "resting here, draw the death
+        // fx" apart from "still flying" apart from "never fired" (0,0,0,0).
+        //   -1 : died on a hit this frame (pierce budget ran out mid-shot)
+        //   -2 : died from time/range alone, no hit this frame (a clean
+        //        end-of-life detonation - drawn bigger, with a ring)
+        const deadF = step(life, float(0));
+        const kind = mix(float(-2), float(-1), hit);
+        bullets.element(instanceIndex).assign(
+          mix(vec4(p1, B.z, max(life, float(0))), vec4(p1, u.time, kind), deadF),
+        );
       });
     })().compute(MAX_BULLETS);
 
@@ -980,25 +994,78 @@ export class Horde {
     bGeo.instanceCount = MAX_BULLETS;
 
     const bA = bullets.toAttribute();
-    const bFlying = step(0.001, bA.w);
-    // 0 -> 1 across the negative-life dust tail
-    const bPuff = clamp(bA.w.negate().div(0.4), 0, 1).mul(step(-0.4, bA.w)).mul(float(1).sub(bFlying));
-    const bAlive = max(bFlying, step(0.001, bPuff));
+    const bFlying = step(0.001, bA.w);              // w > 0: still in flight
+    const bDead = step(0.001, bA.w.negate());       // w < 0: resting at a death
+    // kind -2 (end-of-life) is more negative than kind -1 (died-on-hit)
+    const bDeton = bDead.mul(step(1.5, bA.w.negate()));
+    // time since death; z is the death timestamp once dead, garbage (an angle)
+    // while flying, but every term below is multiplied by bDead/bFlying so the
+    // garbage never reaches colorNode/opacityNode.
+    const bDeathAge = max(u.time.sub(bA.z), float(0));
+
     const bMat = new THREE.MeshBasicNodeMaterial();
+
     // rounds swell just before they detonate, which is the only warning you get
     const bFlare = clamp(float(0.28).sub(bA.w).mul(6), 0, 1);
-    // swells just before going off, then the dust blooms outward as it fades
-    const bSize = float(0.42).add(bFlare.mul(1.4).mul(bFlying)).add(bPuff.mul(5.0)).mul(bAlive);
+    const flySize = float(0.42).add(bFlare.mul(1.4)).mul(bFlying);
+
+    // dead: a hot core for the first ~0.1s, then dust drifting out to ~1.1
+    // world units (~1.8x for an end-of-life detonation) over ~0.55s.
+    const flashT = clamp(float(1).sub(bDeathAge.div(0.1)), 0, 1);
+    const dustT = clamp(bDeathAge.div(0.55), 0, 1);
+    const dustFade = clamp(float(1).sub(dustT), 0, 1);
+    const throwMul = mix(float(1), float(1.8), bDeton);      // detonations throw debris further
+    const deadSize = mix(float(0.55), mix(float(3.2), float(5.2), bDeton), dustT);
+
+    const bSize = flySize.add(deadSize.mul(bDead));
     bMat.positionNode = vec3(bA.xy.add(positionGeometry.xy.mul(bSize)), 0.55);
-    // hot core fading to orange, and a stretch along travel would need the angle,
-    // which the shader has: a round tracer reads fine at this size.
+
+    // uv-space glow: the flying tracer's core and the death flash's core both
+    // want a bright centre fading to the quad's edge, independent of bSize.
     const bd = length(uv().sub(vec2(0.5)));
     const bGlow = clamp(float(1).sub(bd.mul(2.2)), 0, 1);
-    // tracer while flying, warm dust while puffing, fading as it expands
-    const dust = vec3(0.9, 0.68, 0.44);
-    const tracer = vec3(1.7, 1.25, 0.6);
-    bMat.colorNode = mix(dust, tracer, bFlying).mul(bGlow);
-    bMat.opacityNode = bGlow.mul(mix(clamp(float(1).sub(bPuff), 0, 1).mul(0.65), float(1), bFlying));
+    // world-space offset from centre, scaled by the quad's own current extent
+    // so dust puffs read at a roughly constant world size as bSize animates.
+    const worldOff = uv().sub(vec2(0.5)).mul(deadSize);
+
+    // 4 hash-offset soft blobs, each drifting outward from the death point as
+    // dustT ramps 0 -> 1; combined with max() rather than summed so overlap
+    // reads as one cloud instead of blowing out additive brightness.
+    let dustDensity = float(0);
+    for (let k = 0; k < 4; k++) {
+      const seed = uint(abs(bA.x.mul(1013.0).add(bA.y.mul(731.0)).add(float(k * 197))));
+      const ang = hash(seed).mul(6.2831853);
+      const rad = mix(float(0.4), float(1.0), hash(seed.add(uint(53))));
+      const dist = rad.mul(dustT).mul(1.1).mul(throwMul);
+      const center = vec2(cos(ang), sin(ang)).mul(dist);
+      const blobR = max(mix(float(0.55), float(0.32), dustT), 0.001);
+      const d = length(worldOff.sub(center));
+      dustDensity = max(dustDensity, clamp(float(1).sub(d.div(blobR)), 0, 1));
+    }
+
+    // detonation-only: a thin ring expanding out and gone within ~0.25s
+    const ringT = clamp(bDeathAge.div(0.25), 0, 1);
+    const ringR = ringT.mul(1.4).mul(throwMul);
+    const ringD = abs(length(worldOff).sub(ringR));
+    const ring = clamp(float(1).sub(ringD.div(0.18)), 0, 1)
+      .mul(clamp(float(1).sub(ringT), 0, 1)).mul(bDeton);
+
+    const tracerCol = vec3(1.7, 1.25, 0.6);
+    const flashCol = vec3(1.7, 1.55, 1.05);
+    const dustCol = vec3(0.4, 0.44, 0.36);          // moss grey
+    const ringCol = vec3(1.4, 1.05, 0.7);
+
+    bMat.colorNode = tracerCol.mul(bGlow).mul(bFlying)
+      .add(flashCol.mul(flashT).mul(bGlow).mul(bDead))
+      .add(dustCol.mul(dustDensity).mul(dustFade).mul(bDead))
+      .add(ringCol.mul(ring).mul(bDead));
+    bMat.opacityNode = clamp(
+      bGlow.mul(bFlying)
+        .add(flashT.mul(bGlow).mul(bDead))
+        .add(dustDensity.mul(dustFade).mul(0.85).mul(bDead))
+        .add(ring.mul(bDead)),
+      0, 1,
+    );
     bMat.transparent = true;
     bMat.depthWrite = false;
     bMat.blending = THREE.AdditiveBlending;
