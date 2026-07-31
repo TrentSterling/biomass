@@ -99,6 +99,21 @@ export class Waves {
 
   call() {
     if (this.state === 'running') return false;
+    // rushBonus pays MORE the sooner this is called after entering 'build',
+    // and composition()'s shortest wave reaches 'build' well before the 18s
+    // survivor mark -- so a player following the game's own incentive would
+    // otherwise call() straight through a still-pending group and wipe it the
+    // instant survivorSchedule is replaced below, with no toast, no gold, no
+    // record it ever existed. Flush anything still owed from the outgoing
+    // wave first: rushing makes it land right now instead of at its original
+    // timestamp, never makes it vanish.
+    for (const s of this.survivorSchedule) {
+      this.#spawnSurvivors(s.count);
+      if (!this.survivorAnnounced) {
+        this.survivorAnnounced = true;
+        this.onSurvivors?.();
+      }
+    }
     this.wave++;
     // Multiplicative, not linear. A fixed line of turrets has a fixed damage
     // throughput, so linear health means the defence always wins eventually.

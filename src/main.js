@@ -158,6 +158,7 @@ async function resetRun() {
   audioState.blasts = 0;
   audioState.wave = 0;
   audioState.lastLostToast = -999;
+  audioState.lastSavedToast = -999;
   await horde.reset();
   state.hp = BASE_HP;
   state.gold = START_GOLD;
@@ -997,9 +998,16 @@ function tick(dt) {
     const saved = horde.takeSaved();
     if (saved) {
       state.gold += saved * SURVIVOR_REWARD;
-      hud.toast(saved > 1
-        ? `${saved} survivors saved, +${saved * SURVIVOR_REWARD}g`
-        : `survivor saved, +${SURVIVOR_REWARD}g`);
+      // A group of 5 does not always cross the base threshold in the same
+      // tick (contact jostling, turret fire in the way), so this can fire
+      // several times a second for one group landing. Same 3s throttle as
+      // the lost-survivor toast just below, for the same reason.
+      if (state.time - audioState.lastSavedToast > 3) {
+        hud.toast(saved > 1
+          ? `${saved} survivors saved, +${saved * SURVIVOR_REWARD}g`
+          : `survivor saved, +${SURVIVOR_REWARD}g`);
+        audioState.lastSavedToast = state.time;
+      }
     }
     const lost = horde.takeLost();
     if (lost && state.time - audioState.lastLostToast > 3) {
@@ -1025,7 +1033,7 @@ function tick(dt) {
   }
 }
 
-const audioState = { kills: 0, blasts: 0, wave: 0, lastLostToast: -999 };
+const audioState = { kills: 0, blasts: 0, wave: 0, lastLostToast: -999, lastSavedToast: -999 };
 
 function waveText() {
   if (state.sandbox && !BENCH) return 'SANDBOX (G to arm base)';

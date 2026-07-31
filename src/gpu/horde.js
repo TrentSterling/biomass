@@ -32,11 +32,16 @@ import {
   ZOMBIE_TYPES,
   BULLET_PIERCE_COST, BULLET_BLAST, BULLET_BLAST_MULT,
   MAX_BULLETS, MAX_MUZZLES, MUZZLE_BURST, BULLET_SPEED, BULLET_LIFE,
-  SURVIVOR_CHEW_DPS,
+  SURVIVOR_CHEW_DPS, SURVIVOR,
 } from '../config.js';
 
-// The quickest zombie in the table: what the substep count has to keep up with.
-const MAX_SPEED_GUESS = Math.max(...ZOMBIE_TYPES.map((t) => t.speed));
+// The quickest body the substep count has to keep up with. SURVIVOR is kept
+// out of ZOMBIE_TYPES itself (config.js) so waves/stress spawners never pick
+// one up by iterating that array, but it moves through the exact same
+// substep-scaled sim as every hostile and is bound by the same
+// travel-per-substep tunnelling limit, so its speed has to be in this max
+// too even though it is not in the array.
+const MAX_SPEED_GUESS = Math.max(...ZOMBIE_TYPES.map((t) => t.speed), SURVIVOR.speed);
 
 export class Horde {
   constructor(renderer, flowTexture, atlasTexture, basePos) {
@@ -73,6 +78,15 @@ export class Horde {
     const dat = instancedArray(MAX_ZOMBIES, 'vec4');
     const att = instancedArray(MAX_ZOMBIES, 'vec4');
     const dens = instancedArray(DENS_W * DENS_H, 'uint').toAtomic();
+    // Hostile-only twin of dens. crowdAround/densestNear feed rampart chew and
+    // turret aim, both of which mean "where is the threat", not "where is
+    // anybody standing" -- survivors are prey, immune to weapons (simPass),
+    // and must not pull a turret's aim or chew a rampart just by walking past.
+    // dens (all bodies) still exists and still owns the bucket-slot ticket
+    // that scatterPass hands out, so survivors stay in the spatial hash and
+    // keep colliding with the crowd exactly as before; this buffer only feeds
+    // the CPU-side crowd queries.
+    const hostileDens = instancedArray(DENS_W * DENS_H, 'uint').toAtomic();
     // Position at the start of the substep, and the gathered contact correction.
     // Velocity is derived from prev, so this pair is what makes the crowd behave.
     const prev = instancedArray(MAX_ZOMBIES, 'vec2');
@@ -99,7 +113,7 @@ export class Horde {
     const CNT_BUDGET = 11;   // 8 = neighbours the hash had to drop
     const cnt = instancedArray(CNT_BUDGET + MAX_TURRETS + MAX_BLASTS, 'uint').toAtomic();
     const budgetAt = (i) => i.add(int(CNT_BUDGET));
-    this._buffers = { pos, dat, att, dens, bucket, bullets, cnt };
+    this._buffers = { pos, dat, att, dens, hostileDens, bucket, bullets, cnt };
 
     // ---- uniforms ----------------------------------------------------------
     const u = {
@@ -411,7 +425,8 @@ export class Horde {
 
     // ---- pass: scatter -----------------------------------------------------
     this.scatterPass = Fn(() => {
-      If(dat.element(instanceIndex).x.greaterThan(0), () => {
+      const d = dat.element(instanceIndex).toVar();
+      If(d.x.greaterThan(0), () => {
         const P = pos.element(instanceIndex).toVar();
         const p = P.xy.toVar();
         const cx = int(clamp(p.x.mul(DENS_SCALE), float(0), float(DENS_W - 1)));
@@ -427,6 +442,11 @@ export class Horde {
           // biggest body, and a cell that size holds about a dozen of the
           // smallest. Silent until the crowd interpenetrates, so it is counted.
           atomicAdd(cnt.element(8), uint(1));
+        });
+        // Same cell, hostile-only tally. type index lives in d.y; the whole
+        // codebase's survivor/hostile split is d.y > 4.5, matched here.
+        If(d.y.lessThan(4.5), () => {
+          atomicAdd(hostileDens.element(cell), uint(1));
         });
       });
     })().compute(MAX_ZOMBIES);
@@ -1003,6 +1023,7 @@ export class Horde {
     // ---- pass: clear density ----------------------------------------------
     this.clearPass = Fn(() => {
       atomicStore(dens.element(instanceIndex), uint(0));
+      atomicStore(hostileDens.element(instanceIndex), uint(0));
       // The bucket has to be wiped as well, not just the counter that indexes
       // it. Scatter only overwrites the slots it actually fills, so any slot a
       // sparser frame does not reach keeps last frame's zombie index forever.
@@ -1110,7 +1131,17 @@ export class Horde {
     // ~0 shortly after, so a dead slot that never gets reused (a quiet gun, or
     // the tail end of a run) doesn't sit at a permanently oversized, fully
     // rasterized-though-invisible extent for the rest of the run.
-    const settle = clamp(bDeathAge.sub(0.55).div(0.2), 0, 1);
+    // Collapse to zero the instant every visible term above is guaranteed
+    // already at zero (bDeathAge >= 0.55: flashT is 0 by 0.1, ring is gated
+    // off by 0.25, dustFade hits exactly 0 at 0.55), rather than over a
+    // further 0.2s ramp. That ramp left a fully rasterized, oversized,
+    // zero-opacity quad on screen for 0.2s per bullet death -- under
+    // sustained machine-gun fire (MAX_MUZZLES*MUZZLE_BURST rounds/frame,
+    // config.js) that is on the order of thousands of concurrent wasted
+    // overdraw quads. A hard step changes nothing visible here -- opacityNode
+    // is already provably 0 at this instant -- it only stops rasterizing a
+    // quad nobody can see.
+    const settle = step(0.55, bDeathAge);
     const deadSize = mix(float(0.55), mix(float(3.2), float(5.2), bDeton), dustT)
       .mul(float(1).sub(settle));
 
@@ -1371,25 +1402,36 @@ export class Horde {
     // No reuse target here: that argument wants a three.js ReadbackBuffer, and
     // passing a plain ArrayBuffer made the readback throw into the catch below,
     // which silently blinded every turret that aims at the crowd.
-    this.renderer.getArrayBufferAsync(this._buffers.dens.value).then((buf) => {
+    //
+    // Two buffers now: dens (every body, hostile or survivor) gives the exact
+    // headcount for the HUD, hostileDens (hostiles only) builds coarse, the
+    // map crowdAround/densestNear actually query. A survivor cluster must not
+    // read as "the crowd" to a rampart or a turret, so coarse cannot be built
+    // from the mixed buffer any more.
+    Promise.all([
+      this.renderer.getArrayBufferAsync(this._buffers.dens.value),
+      this.renderer.getArrayBufferAsync(this._buffers.hostileDens.value),
+    ]).then(([buf, hostileBuf]) => {
       if (gen !== this._generation) { this._densityInFlight = false; return; }
       this.density = new Uint32Array(buf);
+      const hostile = new Uint32Array(hostileBuf);
       // Every living zombie scatters exactly once, so this sum is the exact head
       // count. The derived spawned-minus-kills estimate drifts upward once the
       // spawn ring starts overwriting live zombies.
-      // One pass builds both the exact head count and a coarse per-world-cell
-      // map. The fine grid is now about one zombie per cell, so anything asking
-      // "where is the crowd" has to read a neighbourhood, not a cell.
+      // One pass builds both the exact head count (all bodies) and a coarse
+      // per-world-cell map (hostiles only). The fine grid is about one zombie
+      // per cell, so anything asking "where is the crowd" has to read a
+      // neighbourhood, not a cell.
       let sum = 0;
+      for (let i = 0; i < this.density.length; i++) sum += this.density[i];
       const coarse = this.coarse;
       coarse.fill(0);
       for (let cy = 0; cy < DENS_H; cy++) {
         const row = cy * DENS_W;
         const wy = (cy / DENS_SCALE) | 0;
         for (let cx = 0; cx < DENS_W; cx++) {
-          const n = this.density[row + cx];
+          const n = hostile[row + cx];
           if (n === 0) continue;
-          sum += n;
           coarse[wy * GRID_W + ((cx / DENS_SCALE) | 0)] += n;
         }
       }
