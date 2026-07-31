@@ -19,7 +19,7 @@ import { Menu } from './menu.js';
 import { startAudio, resumeAudio, configureAudio, toggleMute, isMuted, sfx } from './audio.js';
 import {
   GRID_W, GRID_H, MAX_ZOMBIES, BUILDS, BASE_HP, START_GOLD, ZOMBIE_TYPES, PARAMS, SPAWN_BATCH,
-  DENS_W, DENS_H, DENS_SCALE, ABILITIES, SPEEDS,
+  DENS_W, DENS_H, DENS_SCALE, ABILITIES, SPEEDS, zombieRadius,
 } from './config.js';
 
 // No ?map= means the title screen: the game still boots and plays itself behind
@@ -380,9 +380,17 @@ function stress(n) {
   while (left > 0) {
     const c = Math.min(SPAWN_BATCH, left);
     left -= c;
+    // Spread scales with the head count. A fixed 2.4 put ten thousand bodies
+    // into a patch of twenty-three square units that needs fifteen hundred:
+    // sixty-seven times over-subscribed, which is not a stress test of the
+    // solver so much as a demand it cannot satisfy. The pile overflowed the
+    // spatial hash purely because nothing could fit.
+    const need = n * Math.PI * zombieRadius(t.scale) ** 2;
+    const half = Math.min(GRID_W, GRID_H) / 2 - 1;
     horde.spawn(c, {
       pos: field.spawns[0], hp: t.hp, type: 0, speed: t.speed,
-      gold: t.gold, scale: t.scale, spread: 2.4,
+      gold: t.gold, scale: t.scale,
+      spread: Math.max(2.4, Math.min(half, Math.sqrt(need / 0.35) / 2)),
     });
   }
   hud.toast(horde.stats.spawned > MAX_ZOMBIES ? `+${n} (at capacity, recycling oldest)` : `+${n} zombies`);
@@ -627,6 +635,7 @@ globalThis.__biomass = () => ({
   muzzles: horde._muzzleCount ?? 0, bulletCursor: horde._bulletCursor ?? 0,
   bulletHits: horde.stats.hits ?? 0, stuck: horde.stats.stuck ?? -1,
   oob: horde.stats.oob ?? -1, inRock: horde.stats.inRock ?? -1,
+  hashDrop: horde.stats.hashDrop ?? -1,
   baseSynced: Math.hypot(horde.u.basePos.value.x - field.base.x, horde.u.basePos.value.y - field.base.y) < 0.01,
   map: mapIndex,
   hp: state.hp, over: state.over, won: state.won, sandbox: state.sandbox,
@@ -662,9 +671,12 @@ globalThis.__biomassPerf = () => ({
 // platform edge. This measures circle-vs-cell overlap, the same way the solver
 // now resolves it.
 globalThis.__biomassEmbedded = async () => {
-  const R = 0.22;
   const posBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.pos.value));
   const datBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.dat.value));
+  // Bodies vary in size now, so the test has to read each one's actual radius.
+  // A fixed value here would quietly pass big bodies that are buried and fail
+  // small ones that are clear.
+  const attBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.att.value));
   const n = Math.min(horde.used ?? 0, datBuf.length / 4);
   const { walls, w, h } = field;
   let alive = 0; let embedded = 0; let deep = 0;
@@ -673,6 +685,7 @@ globalThis.__biomassEmbedded = async () => {
     if (datBuf[i * 4] <= 0) continue;
     alive++;
     const x = posBuf[i * 4]; const y = posBuf[i * 4 + 1];
+    const R = attBuf[i * 4 + 3] || 0.15;
     const bx = Math.floor(x); const by = Math.floor(y);
     let worst = 0;
     for (let oy = -1; oy <= 1; oy++) {

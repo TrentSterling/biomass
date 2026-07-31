@@ -24,7 +24,8 @@ import {
 import {
   MAX_ZOMBIES, SPAWN_BATCH, MAX_TURRETS, MAX_BLASTS, GRID_W, GRID_H,
   DENS_W, DENS_H, DENS_SCALE, CORPSE_FADE, BOUNTY_FLOOR,
-  BUCKET_K, ZOMBIE_RADIUS, STEER_ACCEL, TRAVEL_LIMIT,
+  BUCKET_K, ZOMBIE_RADIUS, ZOMBIE_RADIUS_MAX, SPRITE_PER_RADIUS, SIZE_JITTER, zombieRadius,
+  STEER_ACCEL, TRAVEL_LIMIT,
   SWAY_RATE, SWAY_MAX, WANDER_SCALE, WANDER_DRIFT, WANDER_MAX, WANDER_CONE, VISCOSITY, SUBSTEPS, ITERATIONS,
   ZOMBIE_TYPES,
   BULLET_PIERCE_COST, BULLET_BLAST, BULLET_BLAST_MULT,
@@ -82,7 +83,7 @@ export class Horde {
     // 0-3 monotonic, 4 stuck gauge, 5 travel-capped, 6 outside the world,
     // 7 still inside rock after resolution. 6 and 7 are the self-check: both must
     // be zero, and the HUD turns them red the moment they are not.
-    const CNT_BUDGET = 8;
+    const CNT_BUDGET = 9;   // 8 = neighbours the hash had to drop
     const cnt = instancedArray(CNT_BUDGET + MAX_TURRETS + MAX_BLASTS, 'uint').toAtomic();
     const budgetAt = (i) => i.add(int(CNT_BUDGET));
     this._buffers = { pos, dat, att, dens, bucket, bullets, cnt };
@@ -194,6 +195,11 @@ export class Horde {
       return textureLoad(flowTex, ivec2(cx, cy)).z.greaterThan(0.5);
     };
 
+    // A body's physics radius comes straight from the scale it draws at, so the
+    // circle that collides is the circle you can see. att.w carries the scale,
+    // jittered per body at spawn, which means variety costs no storage at all.
+    const radiusOf = (A) => A.w;
+
     // Nearest open cell centre within R cells. Returns the point unchanged when
     // the whole neighbourhood is solid, so callers must tolerate that.
     const nearestOpen = (q, R) => {
@@ -226,9 +232,8 @@ export class Horde {
     //
     // Cells are unit squares on integer boundaries, so the closest point on a
     // cell is just a clamp, and circle-vs-box is exact.
-    const pushOutOfRock = (p) => {
+    const pushOutOfRock = (p, r) => {
       const out = p.toVar();
-      const r = float(ZOMBIE_RADIUS);
 
       If(isRock(out), () => {
         // CENTRE INSIDE GEOMETRY. Resolve by ejection only, never by overlap.
@@ -315,14 +320,18 @@ export class Horde {
         // body onto one buried spot. That is a tighter, more permanent clump
         // than the scatter it replaced.
         const at = vec2(
-          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS), float(GRID_W).sub(ZOMBIE_RADIUS)),
-          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS), float(GRID_H).sub(ZOMBIE_RADIUS)),
+          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS_MAX), float(GRID_W).sub(ZOMBIE_RADIUS_MAX)),
+          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS_MAX), float(GRID_H).sub(ZOMBIE_RADIUS_MAX)),
         ).toVar();
         If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
 
         pos.element(slot).assign(vec4(at, 0, 0));
         dat.element(slot).assign(vec4(u.spawnHp, u.spawnType, s3, 0));
-        att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale));
+        // Size jitter lives in the drawn scale, which the physics radius is
+        // derived from, so one number varies both and they can never disagree.
+        const s4 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(5501))).toVar();
+        const jitter = float(1).add(s4.sub(0.5).mul(float(2 * SIZE_JITTER))).toVar();
+        att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale.mul(jitter)));
       });
     })().compute(SPAWN_BATCH);
 
@@ -366,14 +375,18 @@ export class Horde {
         // body onto one buried spot. That is a tighter, more permanent clump
         // than the scatter it replaced.
         const at = vec2(
-          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS), float(GRID_W).sub(ZOMBIE_RADIUS)),
-          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS), float(GRID_H).sub(ZOMBIE_RADIUS)),
+          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS_MAX), float(GRID_W).sub(ZOMBIE_RADIUS_MAX)),
+          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS_MAX), float(GRID_H).sub(ZOMBIE_RADIUS_MAX)),
         ).toVar();
         If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
 
         pos.element(slot).assign(vec4(at, 0, 0));
         dat.element(slot).assign(vec4(u.spawnHp, u.spawnType, s3, 0));
-        att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale));
+        // Size jitter lives in the drawn scale, which the physics radius is
+        // derived from, so one number varies both and they can never disagree.
+        const s4 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(5501))).toVar();
+        const jitter = float(1).add(s4.sub(0.5).mul(float(2 * SIZE_JITTER))).toVar();
+        att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale.mul(jitter)));
       });
     })().compute(SPAWN_BATCH);
 
@@ -389,6 +402,12 @@ export class Horde {
         // first few zombies in a cell get a bucket slot for the pairwise pass
         If(slot.lessThan(uint(BUCKET_K)), () => {
           bucket.element(cell.mul(int(BUCKET_K)).add(int(slot))).assign(instanceIndex.add(uint(1)));
+        }).Else(() => {
+          // Past BUCKET_K a body is invisible to every neighbour this substep.
+          // Mixed sizes made this reachable: the cell had to grow to fit the
+          // biggest body, and a cell that size holds about a dozen of the
+          // smallest. Silent until the crowd interpenetrates, so it is counted.
+          atomicAdd(cnt.element(8), uint(1));
         });
       });
     })().compute(MAX_ZOMBIES);
@@ -405,7 +424,7 @@ export class Horde {
         Return();
       });
       const p = pos.element(i).xy.toVar();
-      const minDist = float(ZOMBIE_RADIUS * 2).toVar();
+      const ri = radiusOf(att.element(i)).toVar();
       const push = vec2(0).toVar();
       const hits = float(0).toVar();
       const cx = int(clamp(p.x.mul(DENS_SCALE), float(1), float(DENS_W - 2))).toVar();
@@ -426,6 +445,8 @@ export class Horde {
               // behind it genuinely could not push through.
               If(other.notEqual(i).and(dat.element(other).x.greaterThan(0)), () => {
                 const q = pos.element(other).xy.toVar();
+                const rj = radiusOf(att.element(other)).toVar();
+                const minDist = ri.add(rj).toVar();
                 const delta = p.sub(q).toVar();
                 const dist = length(delta).toVar();
                 If(dist.lessThan(minDist), () => {
@@ -435,7 +456,18 @@ export class Horde {
                   const ang = hash(i.add(other).add(uint(7331))).mul(6.2831853).toVar();
                   const n = mix(delta.div(max(dist, float(1e-5))),
                     vec2(cos(ang), sin(ang)), degenerate).toVar();
-                  push.addAssign(n.mul(minDist.sub(dist).mul(0.5)));
+                  // Split the overlap by inverse mass, and take mass from AREA:
+                  // a body twice the radius is four times the mass and yields a
+                  // quarter as much. Physically right, and it costs nothing to
+                  // store because it falls out of the radius.
+                  //
+                  //   share_i = (1/ri^2) / (1/ri^2 + 1/rj^2) = rj^2 / (ri^2 + rj^2)
+                  //
+                  // Equal sizes give half each, exactly as before.
+                  const ri2 = ri.mul(ri).toVar();
+                  const rj2 = rj.mul(rj).toVar();
+                  const share = rj2.div(max(ri2.add(rj2), float(1e-6))).toVar();
+                  push.addAssign(n.mul(minDist.sub(dist).mul(share)));
                   hits.addAssign(1);
                 });
               });
@@ -455,7 +487,8 @@ export class Horde {
       const to = P.xy.add(corr.element(i)).toVar();
       // Contacts first, then geometry: a body squeezed by the crowd ends the
       // step outside the wall rather than inside it.
-      const fixed = pushOutOfRock(to).toVar();
+      const rSelf = radiusOf(att.element(i)).toVar();
+      const fixed = pushOutOfRock(to, rSelf).toVar();
 
       // HARD WORLD BOUNDS. Nothing may exist off the board.
       //
@@ -464,7 +497,7 @@ export class Horde {
       // outside pathing at once, and nothing can tell it to come back. The flood
       // tool was scattering bodies to y = -17 on a board that starts at 0, and
       // they simply stayed there for the rest of the run.
-      const lim = float(ZOMBIE_RADIUS);
+      const lim = rSelf.toVar();
       const bounded = vec2(
         clamp(fixed.x, lim, float(GRID_W).sub(lim)),
         clamp(fixed.y, lim, float(GRID_H).sub(lim)),
@@ -503,7 +536,7 @@ export class Horde {
       // assigning it, so it still cannot overrule a contact.
       const sum = vec2(0).toVar();
       const n = float(0).toVar();
-      const rad = float(ZOMBIE_RADIUS * 2.4).toVar();
+      const ri = radiusOf(att.element(i)).toVar();
       const cx = int(clamp(p.x.mul(DENS_SCALE), float(1), float(DENS_W - 2))).toVar();
       const cy = int(clamp(p.y.mul(DENS_SCALE), float(1), float(DENS_H - 2))).toVar();
       for (let oy = -1; oy <= 1; oy++) {
@@ -518,6 +551,7 @@ export class Horde {
               // standstill.
               If(other.notEqual(i).and(dat.element(other).x.greaterThan(0)), () => {
                 const Q = pos.element(other).toVar();
+                const rad = ri.add(radiusOf(att.element(other))).mul(1.2).toVar();
                 If(length(p.sub(Q.xy)).lessThan(rad), () => {
                   sum.addAssign(Q.zw);
                   n.addAssign(1);
@@ -603,7 +637,7 @@ export class Horde {
       // Discretisation speed limit: never travel more than a fraction of a body
       // radius in one substep, or a body steps through the crowd in front of it
       // before the solver ever sees the contact.
-      const vmax = float(ZOMBIE_RADIUS * TRAVEL_LIMIT).div(u.h).toVar();
+      const vmax = radiusOf(A).mul(float(TRAVEL_LIMIT)).div(u.h).toVar();
       const sp2 = length(v).add(1e-5).toVar();
       If(sp2.greaterThan(vmax), () => {
         v.mulAssign(vmax.div(sp2));
@@ -863,7 +897,7 @@ export class Horde {
       for (let k = 0; k < BUCKET_K; k++) {
         bucket.element(base.add(uint(k))).assign(uint(0));
       }
-      If(instanceIndex.lessThan(uint(2)), () => {
+      If(instanceIndex.lessThan(uint(3)), () => {
         atomicStore(cnt.element(instanceIndex.add(uint(6))), uint(0));
       });
       If(instanceIndex.lessThan(uint(MAX_TURRETS + MAX_BLASTS)), () => {
@@ -899,7 +933,7 @@ export class Horde {
     const vis = mix(fade, float(1), aliveF);
     const live = step(0.001, vis);                    // empty slots collapse to zero area
     const hitPop = clamp(float(1).sub(u.time.sub(attA.z).mul(5)), 0, 1).mul(aliveF);
-    const size = attA.w
+    const size = attA.w.mul(float(SPRITE_PER_RADIUS))
       .mul(mix(float(1.5), float(1), aliveF))
       .mul(float(1).add(hitPop.mul(0.4)).add(spark.mul(0.8)))
       .mul(live);
@@ -1042,7 +1076,10 @@ export class Horde {
       u.spawnType.value = s.type;
       u.spawnSpeed.value = s.speed;
       u.spawnGold.value = s.gold;
-      u.spawnScale.value = s.scale;
+      // att.w carries the physics radius, not the drawn scale: the sprite is
+      // sized from it, so the circle that collides and the circle you see are
+      // the same number and can never drift apart again.
+      u.spawnScale.value = zombieRadius(s.scale);
       u.spawnSeed.value = (this._seed = (this._seed * 1664525 + 1013904223) & 0x7fffffff);
       renderer.compute(this.spawnPass);
       this.cursor = (this.cursor + s.count) % MAX_ZOMBIES;
@@ -1116,6 +1153,7 @@ export class Horde {
       // is impossible.
       this.stats.oob = c[6] ?? 0;
       this.stats.inRock = c[7] ?? 0;
+      this.stats.hashDrop = c[8] ?? 0;
       this._lastStuck = c[4];
       this.pendingGold += dGold;
       this.pendingLeaks += dLeaks;

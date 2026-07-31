@@ -17,7 +17,11 @@ export const GRID_H = AUTHOR_H * CELL_SCALE;   // 56
 // noticed; a crowd packed against a beam lost most of its contacts and turned to
 // treacle. At 2 the cell is 0.5, comfortably past the 0.44 it has to cover.
 //
-//   cell size = 1 / DENS_SCALE  >=  2 * ZOMBIE_RADIUS
+//   cell size = 1 / DENS_SCALE  >=  2 * ZOMBIE_RADIUS_MAX
+//
+// Bodies vary in size, so the cell must clear the LARGEST contact diameter or a
+// big body cannot see the neighbour it is touching. The radius curve is capped
+// precisely so that stays true at a half-unit cell: 0.47 against 0.5.
 export const DENS_SCALE = 2;
 export const DENS_W = GRID_W * DENS_SCALE;
 export const DENS_H = GRID_H * DENS_SCALE;
@@ -70,8 +74,40 @@ export const SPRITE_PX = 16;             // zombie sprite size in atlas
 // Contact physics, not steering. Zombies are discs that push each other apart and
 // cancel the closing part of their relative velocity, resolved twice a frame
 // against the spatial hash. The flow field is the only thing that steers.
-export const BUCKET_K = 8;
-export const ZOMBIE_RADIUS = 0.22;          // half a shambler, for circle overlap
+// The neighbour loops are unrolled at shader compile time, so this is a direct
+// multiplier on shader size: 9 cells x BUCKET_K inlined bodies, twice over.
+// Raising it to 20 to cope with a one-unit cell dropped the sim to five frames
+// in eight seconds on register pressure alone. Keep the cell small instead.
+export const BUCKET_K = 12;
+// Physics radius is DERIVED from the drawn scale, so a body collides at the size
+// it appears. These were divorced before: a bloater drew at 0.80 and collided at
+// 0.22 like everything else, so the big ones visibly overlapped each other.
+// The size range is COMPRESSED on purpose. Radius is not proportional to the
+// drawn scale, it is scale^0.6 against the largest body, which keeps a visible
+// half-again difference between a sprinter and a bloater while holding the
+// biggest contact diameter under the hash cell.
+//
+// That ceiling is the whole design: the cell must clear the largest diameter,
+// and a larger cell holds more small bodies, and BUCKET_K is a direct
+// multiplier on unrolled shader size. Letting a bloater collide at its full
+// drawn size would have forced a one-unit cell and a shader that will not run.
+export const RADIUS_AT_MAX_SCALE = 0.21;
+export const MAX_TYPE_SCALE = 0.80;
+export const zombieRadius = (scale) =>
+  RADIUS_AT_MAX_SCALE * (scale / MAX_TYPE_SCALE) ** 0.6;
+
+// Per-body jitter, from the body's own seed. Free variety: a crowd of identical
+// circles reads as manufactured however good the motion is.
+export const SIZE_JITTER = 0.12;            // +/- 12%
+
+// Sprites draw proportional to the physics radius, so what collides is what you
+// see, only with the range decompressed again for readability.
+export const SPRITE_PER_RADIUS = 3.0;
+
+// The extremes, which together set the hash cell and the bucket depth.
+export const ZOMBIE_RADIUS_MAX = zombieRadius(MAX_TYPE_SCALE) * (1 + SIZE_JITTER);
+export const ZOMBIE_RADIUS_MIN = zombieRadius(0.40) * (1 - SIZE_JITTER);
+export const ZOMBIE_RADIUS = zombieRadius(0.46);
 // Ceiling on the single steering force, as a fraction of top speed. The flow
 // field always wins; this only decides how much a crowd may spread sideways to
 // fill the space it is walking through.
