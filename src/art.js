@@ -86,6 +86,140 @@ function drawZombie(ctx, ox, body, dark, light, wound) {
   ctx.fillRect(ox + cx + 1, 12, 2, 3);
 }
 
+// Husk: a shambler swollen past the point it can lift its arms far. Wider
+// silhouette than any of the three original types, a bright plated band
+// across the chest standing in for the lit top edge the others use, and a
+// duller grey-green than the shambler so it still reads as one species.
+const HUSK_BODY = [
+  [2, 8], [3, 12], [4, 14], [5, 14], [6, 14], [7, 14], [8, 14], [9, 12], [10, 10], [11, 7],
+];
+function drawHusk(ctx, ox, body, dark, light, wound) {
+  const cx = SPRITE_PX / 2;
+  ctx.fillStyle = dark;
+  for (const [y, w] of HUSK_BODY) ctx.fillRect(ox + cx - w / 2 - 1, y - 1, w + 2, 3);
+  ctx.fillStyle = body;
+  for (const [y, w] of HUSK_BODY) ctx.fillRect(ox + cx - w / 2, y, w, 1);
+
+  // stub arms, thick and close: too swollen to reach far
+  ctx.fillStyle = dark;
+  ctx.fillRect(ox + cx - 8, 6, 3, 3);
+  ctx.fillRect(ox + cx + 5, 6, 3, 3);
+  ctx.fillStyle = body;
+  ctx.fillRect(ox + cx - 7, 7, 2, 2);
+  ctx.fillRect(ox + cx + 6, 7, 2, 2);
+
+  // plated band across the chest, reads as armor plating rather than a lit edge
+  ctx.fillStyle = light;
+  ctx.fillRect(ox + cx - 6, 6, 12, 2);
+  ctx.fillStyle = dark;
+  ctx.fillRect(ox + cx - 6, 7, 12, 1);
+
+  // single dark socket, sunken in the swollen face
+  ctx.fillStyle = '#0d1108';
+  ctx.fillRect(ox + cx - 2, 3, 3, 2);
+
+  // wound low on the gut, where the swelling splits
+  ctx.fillStyle = wound;
+  ctx.fillRect(ox + cx - 2, 9, 3, 2);
+  ctx.fillRect(ox + cx - 1, 11, 2, 1);
+
+  // two heavy dragging feet, both trailing: too bloated to lift either
+  ctx.fillStyle = dark;
+  ctx.fillRect(ox + cx - 5, 13, 4, 2);
+  ctx.fillRect(ox + cx + 1, 13, 4, 2);
+}
+
+// Crawler: low, wide and small, hauling itself forward on both arms with no
+// feet at all. The silhouette sits in the bottom half of the tile rather than
+// standing tall, which is the cue that reads "crawling" at sprite scale.
+// Widest at the front (top) and tapering to a narrow trailing tail, the
+// opposite of a standing zombie's silhouette: shoulders lead, everything
+// else drags behind. The front row spans the full head/shoulder width so
+// there is no gap at top-centre for the arm stubs to read as ears.
+const CRAWL_BODY = [
+  [7, 8], [8, 11], [9, 12], [10, 12], [11, 10], [12, 7], [13, 4],
+];
+function drawCrawler(ctx, ox, body, dark, light, wound) {
+  const cx = SPRITE_PX / 2;
+  ctx.fillStyle = dark;
+  for (const [y, w] of CRAWL_BODY) ctx.fillRect(ox + cx - w / 2 - 1, y - 1, w + 2, 2);
+  ctx.fillStyle = body;
+  for (const [y, w] of CRAWL_BODY) ctx.fillRect(ox + cx - w / 2, y, w, 1);
+
+  // short arm stubs flush against the front edge, reaching out and slightly
+  // forward rather than standing tall above the body like ears
+  ctx.fillStyle = dark;
+  ctx.fillRect(ox + cx - 6, 5, 2, 3);
+  ctx.fillRect(ox + cx + 4, 5, 2, 3);
+  ctx.fillStyle = body;
+  ctx.fillRect(ox + cx - 5, 6, 1, 2);
+  ctx.fillRect(ox + cx + 5, 6, 1, 2);
+
+  // clouded eyes, close together, set in the wide front of the body
+  ctx.fillStyle = '#0d1108';
+  ctx.fillRect(ox + cx - 3, 8, 1, 1);
+  ctx.fillRect(ox + cx + 2, 8, 1, 1);
+
+  // lit ridge along the spine, low and narrow since it hugs the ground
+  ctx.fillStyle = light;
+  ctx.fillRect(ox + cx - 2, 10, 4, 1);
+
+  // wound on the tapering tail
+  ctx.fillStyle = wound;
+  ctx.fillRect(ox + cx - 1, 11, 2, 2);
+
+  // deliberately no feet: it hauls itself by the arms, not the legs
+}
+
+// Survivor: the one thing in the atlas that has to read as alive at a glance.
+// Upright and narrow, no outstretched arms (the opposite cue from every
+// rotting type here), warm tan/olive fatigues, a small backpack block, and a
+// clear skin-tone head instead of a clouded socket.
+const SURVIVOR_BODY = [
+  [4, 6], [5, 7], [6, 7], [7, 7], [8, 7], [9, 7], [10, 6], [11, 5],
+];
+function drawSurvivor(ctx, ox) {
+  const cx = SPRITE_PX / 2;
+  const cloth = '#8a7a4a';
+  const clothDark = '#332c1a';
+  const clothLight = '#b0a06a';
+  const skin = '#d9a878';
+  const pack = '#4a5230';
+
+  ctx.fillStyle = clothDark;
+  for (const [y, w] of SURVIVOR_BODY) ctx.fillRect(ox + cx - w / 2 - 1, y - 1, w + 2, 3);
+  ctx.fillStyle = cloth;
+  for (const [y, w] of SURVIVOR_BODY) ctx.fillRect(ox + cx - w / 2, y, w, 1);
+
+  // small backpack riding high on the back: the one equipment cue that says
+  // "person" rather than "bare zombie" at a glance
+  ctx.fillStyle = pack;
+  ctx.fillRect(ox + cx - 3, 5, 6, 3);
+  ctx.fillStyle = clothDark;
+  ctx.fillRect(ox + cx - 3, 5, 6, 1);
+
+  // lit shoulder line, narrow and tidy: no hunch, this one still stands straight
+  ctx.fillStyle = clothLight;
+  ctx.fillRect(ox + cx - 3, 4, 6, 1);
+
+  // arms tucked at the sides, not reaching: the opposite cue from every
+  // rotting thing in this atlas
+  ctx.fillStyle = clothDark;
+  ctx.fillRect(ox + cx - 4, 6, 1, 4);
+  ctx.fillRect(ox + cx + 3, 6, 1, 4);
+
+  // clear skin-tone head, unmistakably alive
+  ctx.fillStyle = skin;
+  ctx.fillRect(ox + cx - 2, 2, 4, 3);
+  ctx.fillStyle = clothDark;
+  ctx.fillRect(ox + cx - 2, 2, 4, 1);
+
+  // feet together and even: no drag
+  ctx.fillStyle = clothDark;
+  ctx.fillRect(ox + cx - 3, 12, 2, 2);
+  ctx.fillRect(ox + cx + 1, 12, 2, 2);
+}
+
 function drawGore(ctx, ox) {
   const r = rng(7331);
   ctx.fillStyle = PALETTE.blood;
@@ -103,18 +237,25 @@ function drawGore(ctx, ox) {
   }
 }
 
-// Tiles: 0 shambler, 1 bloater, 2 sprinter, 3 gore
+// Tiles: 0 shambler, 1 bloater, 2 sprinter, 3 husk, 4 crawler, 5 survivor, 6 gore
 //
-// The three read as one species at three stages of rot rather than as three
-// unrelated monsters: pallid grey-green, swollen jaundiced, and a fresher,
-// bloodier one that still has colour in it.
+// The first three read as one species at three stages of rot rather than as
+// three unrelated monsters: pallid grey-green, swollen jaundiced, and a
+// fresher, bloodier one that still has colour in it. 3-5 extend that same
+// read (bulkier rot, low crawling rot, and the one living thing in the atlas)
+// without disturbing the original three, which are byte-for-byte unchanged.
+// Types 3-5 are not spawned yet; the tiles just need to exist and look right.
+export const TILE_COUNT = 7;
 export function makeZombieAtlas() {
-  const c = canvas(SPRITE_PX * 4, SPRITE_PX);
+  const c = canvas(SPRITE_PX * TILE_COUNT, SPRITE_PX);
   const ctx = c.getContext('2d');
   drawZombie(ctx, 0, '#6c7f5a', '#232b1d', '#93a67e', '#7a2018');
   drawZombie(ctx, SPRITE_PX, '#9a9a52', '#33320f', '#c2c179', '#8d3a1c');
   drawZombie(ctx, SPRITE_PX * 2, '#8a6a5c', '#2b1d18', '#b08d7c', '#a52a1e');
-  drawGore(ctx, SPRITE_PX * 3);
+  drawHusk(ctx, SPRITE_PX * 3, '#5a6650', '#20261c', '#8a9a78', '#6a2c1c');
+  drawCrawler(ctx, SPRITE_PX * 4, '#6e7a5c', '#242c1c', '#9aa87e', '#7a2018');
+  drawSurvivor(ctx, SPRITE_PX * 5);
+  drawGore(ctx, SPRITE_PX * 6);
   return pixelTexture(c);
 }
 
@@ -305,6 +446,69 @@ export function makeBeam() {
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
+}
+
+// Top-down twin-prop gunship, nose pointing +x, chunky pixel style to match
+// the rest of the art. Nothing consumes this yet; it exists so a future
+// air-support ability has a sprite ready to go.
+export function makePlaneTexture() {
+  const W = 48, H = 24;
+  const c = canvas(W, H);
+  const ctx = c.getContext('2d');
+  const cy = H / 2;
+  const gun = '#4a4f57';        // gunmetal fuselage
+  const gunDark = '#24272b';    // gunmetal shadow / outline
+  const gunLight = '#7a828c';   // lit spine highlight
+  const olive = '#5a6b3f';      // olive drab wing/tail panels
+  const oliveDark = '#33401f';
+  const glass = '#9ec8e8';      // cockpit glazing
+
+  // wings, laid down first so the fuselage draws over them
+  ctx.fillStyle = oliveDark;
+  ctx.fillRect(16, 1, 14, H - 2);
+  ctx.fillStyle = olive;
+  ctx.fillRect(17, 2, 12, H - 4);
+  ctx.fillStyle = oliveDark;
+  ctx.beginPath(); ctx.moveTo(29, 2); ctx.lineTo(34, 5); ctx.lineTo(29, 8); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(29, H - 2); ctx.lineTo(34, H - 5); ctx.lineTo(29, H - 8); ctx.closePath(); ctx.fill();
+
+  // tail stabilizer, narrower than the wing, at the tail end
+  ctx.fillStyle = oliveDark;
+  ctx.fillRect(2, 6, 8, H - 12);
+  ctx.fillStyle = olive;
+  ctx.fillRect(3, 7, 6, H - 14);
+
+  // fuselage, nose pointing +x toward the right edge
+  ctx.fillStyle = gunDark;
+  ctx.fillRect(6, cy - 5, 38, 10);
+  ctx.fillStyle = gun;
+  ctx.fillRect(6, cy - 4, 37, 8);
+  ctx.fillStyle = gunDark;
+  ctx.beginPath(); ctx.moveTo(44, cy - 4); ctx.lineTo(W, cy); ctx.lineTo(44, cy + 4); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = gun;
+  ctx.beginPath(); ctx.moveTo(43, cy - 3); ctx.lineTo(46, cy); ctx.lineTo(43, cy + 3); ctx.closePath(); ctx.fill();
+
+  // lit spine down the centreline
+  ctx.fillStyle = gunLight;
+  ctx.fillRect(8, cy - 1, 34, 1);
+
+  // cockpit glazing just aft of the nose
+  ctx.fillStyle = glass;
+  ctx.fillRect(38, cy - 2, 4, 4);
+
+  // twin engine nacelles on the wings, each with a soft spinning-prop disc
+  for (const oy of [-8, 8]) {
+    ctx.fillStyle = gunDark;
+    ctx.fillRect(20, cy + oy - 3, 9, 6);
+    ctx.fillStyle = gun;
+    ctx.fillRect(21, cy + oy - 2, 7, 4);
+    ctx.fillStyle = 'rgba(210,214,220,0.35)';
+    ctx.beginPath(); ctx.arc(24, cy + oy, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#15181c';
+    ctx.beginPath(); ctx.arc(24, cy + oy, 1.6, 0, Math.PI * 2); ctx.fill();
+  }
+
+  return pixelTexture(c);
 }
 
 export function pixelTexture(canvasEl) {

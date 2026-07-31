@@ -21,6 +21,8 @@ import {
   hash, positionGeometry, uv, mx_noise_float,
 } from 'three/tsl';
 
+import { TILE_COUNT } from '../art.js';
+
 import {
   MAX_ZOMBIES, SPAWN_BATCH, MAX_TURRETS, MAX_BLASTS, GRID_W, GRID_H,
   DENS_W, DENS_H, DENS_SCALE, CORPSE_FADE, BOUNTY_FLOOR,
@@ -954,8 +956,8 @@ export class Horde {
       mix(float(0.02), float(0.10), aliveF),          // corpses sit under the living
     );
 
-    const tile = mix(float(3), datA.y, aliveF);       // tile 3 of the atlas is gore
-    const tex = texture(atlasTexture, vec2(uv().x.add(tile).div(4), uv().y));
+    const tile = mix(float(TILE_COUNT - 1), datA.y, aliveF);   // last tile of the atlas is gore
+    const tex = texture(atlasTexture, vec2(uv().x.add(tile).div(TILE_COUNT), uv().y));
     const dry = mix(vec3(0.34, 0.07, 0.06), vec3(1), wet);
     const flash = hitPop;
     mat.colorNode = tex.rgb.mul(mix(dry, vec3(1), aliveF))
