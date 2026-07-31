@@ -32,6 +32,7 @@ import {
   ZOMBIE_TYPES,
   BULLET_PIERCE_COST, BULLET_BLAST, BULLET_BLAST_MULT,
   MAX_BULLETS, MAX_MUZZLES, MUZZLE_BURST, BULLET_SPEED, BULLET_LIFE,
+  SURVIVOR_CHEW_DPS,
 } from '../config.js';
 
 // The quickest zombie in the table: what the substep count has to keep up with.
@@ -44,9 +45,11 @@ export class Horde {
     this.cursor = 0;
 
     // Totals the CPU believes in, updated from async readbacks.
-    this.stats = { kills: 0, leaks: 0, gold: 0, spawned: 0, alive: 0, recycled: 0 };
+    this.stats = { kills: 0, leaks: 0, gold: 0, spawned: 0, alive: 0, recycled: 0, saved: 0, lost: 0 };
     this._lastCounters = [0, 0, 0, 0];
     this._lastStuck = 0;
+    this._lastSaved = 0;
+    this._lastLost = 0;
     this._countersInFlight = false;
     this._generation = 0;
     this._densityInFlight = false;
@@ -55,6 +58,8 @@ export class Horde {
     this.coarse = new Uint32Array(GRID_W * GRID_H);
     this.pendingLeaks = 0;
     this.pendingGold = 0;
+    this.pendingSaved = 0;
+    this.pendingLost = 0;
     // Runtime tunable so the solver budget can be swept against the jitter gauge
     // without a rebuild. Defaults come from config.
     this.substeps = SUBSTEPS;
@@ -71,7 +76,12 @@ export class Horde {
     // Position at the start of the substep, and the gathered contact correction.
     // Velocity is derived from prev, so this pair is what makes the crowd behave.
     const prev = instancedArray(MAX_ZOMBIES, 'vec2');
-    const corr = instancedArray(MAX_ZOMBIES, 'vec2');
+    // xy: push correction, same as ever. z: how many HOSTILE neighbours are
+    // touching this body right now, tallied only when the body itself is a
+    // survivor (relaxPass) -- simPass reads it once a frame to chew a survivor
+    // down. Widened from vec2 rather than adding a new buffer, so the 8-storage
+    // budget never moves.
+    const corr = instancedArray(MAX_ZOMBIES, 'vec4');
     // Spatial hash: up to BUCKET_K zombie indices per cell, written as index+1 so
     // zero means empty. Not atomic, only the counter is.
     const bucket = instancedArray(DENS_W * DENS_H * BUCKET_K, 'uint');
@@ -85,7 +95,8 @@ export class Horde {
     // 0-3 monotonic, 4 stuck gauge, 5 travel-capped, 6 outside the world,
     // 7 still inside rock after resolution. 6 and 7 are the self-check: both must
     // be zero, and the HUD turns them red the moment they are not.
-    const CNT_BUDGET = 9;   // 8 = neighbours the hash had to drop
+    // 9 survivors saved, 10 survivors lost -- monotonic, same as 0-3.
+    const CNT_BUDGET = 11;   // 8 = neighbours the hash had to drop
     const cnt = instancedArray(CNT_BUDGET + MAX_TURRETS + MAX_BLASTS, 'uint').toAtomic();
     const budgetAt = (i) => i.add(int(CNT_BUDGET));
     this._buffers = { pos, dat, att, dens, bucket, bullets, cnt };
@@ -304,7 +315,7 @@ export class Horde {
     // without the CPU having to track an offset.
     this.counterResetPass = Fn(() => {
       atomicStore(cnt.element(instanceIndex), uint(0));
-    })().compute(4);
+    })().compute(CNT_BUDGET);
 
     // ---- pass: spawn -------------------------------------------------------
     this.spawnPass = Fn(() => {
@@ -359,7 +370,7 @@ export class Horde {
     // without the CPU having to track an offset.
     this.counterResetPass = Fn(() => {
       atomicStore(cnt.element(instanceIndex), uint(0));
-    })().compute(4);
+    })().compute(CNT_BUDGET);
 
     // ---- pass: spawn -------------------------------------------------------
     this.spawnPass = Fn(() => {
@@ -427,14 +438,19 @@ export class Horde {
     // apply only writes.
     this.relaxPass = Fn(() => {
       const i = instanceIndex;
-      If(dat.element(i).x.lessThanEqual(0), () => {
-        corr.element(i).assign(vec2(0));
+      const self = dat.element(i).toVar();
+      If(self.x.lessThanEqual(0), () => {
+        corr.element(i).assign(vec4(0));
         Return();
       });
       const p = pos.element(i).xy.toVar();
       const ri = radiusOf(att.element(i)).toVar();
       const push = vec2(0).toVar();
       const hits = float(0).toVar();
+      // Hostile neighbours actually touching THIS body, counted only when this
+      // body is a survivor (self.y > 4.5). simPass reads this once a frame to
+      // chew a survivor down; a hostile chewing another hostile never sets it.
+      const chew = float(0).toVar();
       const cx = int(clamp(p.x.mul(DENS_SCALE), float(1), float(DENS_W - 2))).toVar();
       const cy = int(clamp(p.y.mul(DENS_SCALE), float(1), float(DENS_H - 2))).toVar();
 
@@ -445,13 +461,16 @@ export class Horde {
             const raw = bucket.element(cell.mul(int(BUCKET_K)).add(int(k))).toVar();
             If(raw.greaterThan(uint(0)), () => {
               const other = raw.sub(uint(1)).toVar();
+              // Whole vec4 fetched once and reused for both the alive check and
+              // the type check below, rather than two separate reads.
+              const od = dat.element(other).toVar();
               // Alive check on the NEIGHBOUR, not just on self. Without it the
               // living collide with the dead: a corpse keeps its slot in the
               // hash, never moves again, and becomes a permanent invisible
               // bollard exactly where it fell. A beam that kills a rank was
               // therefore building a wall out of the bodies, and the horde
               // behind it genuinely could not push through.
-              If(other.notEqual(i).and(dat.element(other).x.greaterThan(0)), () => {
+              If(other.notEqual(i).and(od.x.greaterThan(0)), () => {
                 const q = pos.element(other).xy.toVar();
                 const delta = p.sub(q).toVar();
                 const dist = length(delta).toVar();
@@ -483,6 +502,13 @@ export class Horde {
                   const share = rj2.div(max(ri2.add(rj2), float(1e-6))).toVar();
                   push.addAssign(n.mul(minDist.sub(dist).mul(share)));
                   hits.addAssign(1);
+                  // The chew tally lives in this exact branch, not the wider
+                  // reject test above it: it only ever needs to fire for pairs
+                  // that are genuinely overlapping, which is the same set of
+                  // reads the contact solver already paid for.
+                  If(self.y.greaterThan(4.5).and(od.y.lessThan(4.5)), () => {
+                    chew.addAssign(1);
+                  });
                 });
                 });
               });
@@ -492,14 +518,14 @@ export class Horde {
       }
       // Averaged, not summed. A body with eight neighbours pushing on it must
       // move once, not eight times.
-      corr.element(i).assign(push.div(max(hits, float(1))));
+      corr.element(i).assign(vec4(push.div(max(hits, float(1))), chew, 0));
     })().compute(MAX_ZOMBIES);
 
     this.applyPass = Fn(() => {
       const i = instanceIndex;
       If(dat.element(i).x.lessThanEqual(0), () => { Return(); });
       const P = pos.element(i).toVar();
-      const to = P.xy.add(corr.element(i)).toVar();
+      const to = P.xy.add(corr.element(i).xy).toVar();
       // Contacts first, then geometry: a body squeezed by the crowd ends the
       // step outside the wall rather than inside it.
       const rSelf = radiusOf(att.element(i)).toVar();
@@ -776,10 +802,24 @@ export class Horde {
             If(float(slot).lessThan(this.blastCaps.element(i).x), () => { dmg.addAssign(B.w); });
           });
         });
-        If(dmg.greaterThan(0), () => { hp.subAssign(dmg.mul(u.dt)); });
+        // Weapons and blasts are the player's arsenal, not a threat to a
+        // survivor: the crowd is what eats them (chew, just below). Touch/flash
+        // still registers above regardless of type -- only the health hit is
+        // gated here, which is the one guard the whole weapon system needs.
+        If(dmg.greaterThan(0).and(d.y.lessThan(4.5)), () => { hp.subAssign(dmg.mul(u.dt)); });
         If(touched.greaterThan(0.5), () => { A.z.assign(u.time); });   // flash
 
-        // ---- reached the base: counts as a leak, not a kill
+        // ---- chew: a hostile pressed against a survivor eats it at a flat
+        // rate. Tallied during the last contact solve of this frame (relaxPass
+        // writes corr.z only when d.y is a survivor and the neighbour is not).
+        const chew = corr.element(instanceIndex).z;
+        If(d.y.greaterThan(4.5).and(chew.greaterThan(0)), () => {
+          hp.subAssign(chew.mul(float(SURVIVOR_CHEW_DPS)).mul(u.dt));
+        });
+
+        // ---- reached the base: a hostile leaks (damages the base); a survivor
+        // is saved (gold, no damage). Either way it vanishes the same instant,
+        // never as a kill.
         // Two tests on purpose. The distance one is precise; the field one cannot
         // desync from the map, because it reads the same bake the zombie is walking
         // down. A stale base uniform used to leave zombies jiggling on top of the
@@ -790,7 +830,15 @@ export class Horde {
         If(atBase, () => {
           hp.assign(-1);
           d.w.assign(u.time);
-          atomicAdd(cnt.element(1), uint(1));
+          If(d.y.greaterThan(4.5), () => {
+            // Vanish cleanly: att.w doubles as the drawn scale (see the render
+            // size formula below), so zeroing it collapses the sprite to
+            // nothing instead of leaving a corpse.
+            A.w.assign(0);
+            atomicAdd(cnt.element(9), uint(1));
+          }).Else(() => {
+            atomicAdd(cnt.element(1), uint(1));
+          });
         });
 
         // Monotonic count of zombie-frames spent inside rock. Goal-ward speed is
@@ -811,14 +859,21 @@ export class Horde {
       // vanished silently with no kill, no bounty and no corpse.
       If(d.x.lessThanEqual(0).and(d.w.equal(0)), () => {
         d.w.assign(u.time);
-        atomicAdd(cnt.element(0), uint(1));
-        // Bounty by progress: killed leaving the portal pays a fraction, killed
-        // at the gate pays in full.
-        const here = pos.element(instanceIndex).xy.toVar();
-        const progress = float(1).sub(pathDist(here)).toVar();
-        const worth = att.element(instanceIndex).y
-          .mul(float(BOUNTY_FLOOR).add(progress.mul(1 - BOUNTY_FLOOR)));
-        atomicAdd(cnt.element(2), uint(max(worth, 1)));
+        If(d.y.greaterThan(4.5), () => {
+          // A survivor caught by the horde: lost, not killed, and no bounty --
+          // eating a survivor costs the player, it does not pay them. The
+          // corpse still renders (gore is fine, they are meat now).
+          atomicAdd(cnt.element(10), uint(1));
+        }).Else(() => {
+          atomicAdd(cnt.element(0), uint(1));
+          // Bounty by progress: killed leaving the portal pays a fraction, killed
+          // at the gate pays in full.
+          const here = pos.element(instanceIndex).xy.toVar();
+          const progress = float(1).sub(pathDist(here)).toVar();
+          const worth = att.element(instanceIndex).y
+            .mul(float(BOUNTY_FLOOR).add(progress.mul(1 - BOUNTY_FLOOR)));
+          atomicAdd(cnt.element(2), uint(max(worth, 1)));
+        });
       });
       dat.element(instanceIndex).assign(d);
     })().compute(MAX_ZOMBIES);
@@ -874,7 +929,9 @@ export class Horde {
             If(hit.lessThan(0.5).and(raw.greaterThan(uint(0))), () => {
               const other = raw.sub(uint(1)).toVar();
               const target = dat.element(other).toVar();
-              If(target.x.greaterThan(0), () => {
+              // Survivors are not hostile: a round passes through one untouched,
+              // no hit, no pierce cost, no counter.
+              If(target.x.greaterThan(0).and(target.y.lessThan(4.5)), () => {
                 const q = pos.element(other).xy.toVar();
                 If(length(sp.sub(q)).lessThan(float(ZOMBIE_RADIUS * 2.2)), () => {
                   // Read, modify, write the whole vec4: assigning a single
@@ -911,7 +968,7 @@ export class Horde {
                 If(raw.greaterThan(uint(0)), () => {
                   const idx = raw.sub(uint(1)).toVar();
                   const tv = dat.element(idx).toVar();
-                  If(tv.x.greaterThan(0), () => {
+                  If(tv.x.greaterThan(0).and(tv.y.lessThan(4.5)), () => {
                     If(length(pos.element(idx).xy.sub(p1)).lessThan(r), () => {
                       tv.x.assign(max(tv.x.sub(blastDmg), float(0)));
                       dat.element(idx).assign(tv);
@@ -1153,11 +1210,15 @@ export class Horde {
     this._generation++;                 // discard any readback still in flight
     this.cursor = 0;
     this._spawnQueue.length = 0;
-    this.stats = { kills: 0, leaks: 0, gold: 0, spawned: 0, alive: 0, recycled: 0, recycling: false };
+    this.stats = { kills: 0, leaks: 0, gold: 0, spawned: 0, alive: 0, recycled: 0, recycling: false, saved: 0, lost: 0 };
     this._lastCounters = [0, 0, 0, 0];
     this._lastStuck = 0;
+    this._lastSaved = 0;
+    this._lastLost = 0;
     this.pendingGold = 0;
     this.pendingLeaks = 0;
+    this.pendingSaved = 0;
+    this.pendingLost = 0;
     this.density = new Uint32Array(DENS_W * DENS_H);
     this.u.turretCount.value = 0;
     this.u.blastCount.value = 0;
@@ -1277,6 +1338,16 @@ export class Horde {
       this._lastStuck = c[4];
       this.pendingGold += dGold;
       this.pendingLeaks += dLeaks;
+      // Survivors saved/lost: monotonic counters, same shape as kills/leaks/gold
+      // above, diffed the same way so a caller can drain them exactly once.
+      const dSaved = (c[9] ?? 0) - this._lastSaved;
+      const dLost = (c[10] ?? 0) - this._lastLost;
+      this._lastSaved = c[9] ?? 0;
+      this._lastLost = c[10] ?? 0;
+      this.stats.saved = this._lastSaved;
+      this.stats.lost = this._lastLost;
+      this.pendingSaved += dSaved;
+      this.pendingLost += dLost;
       // Zombies overwritten by the spawn ring never report a death, so the derived
       // headcount would drift above capacity. Clamp it.
       this.stats.recycling = this.stats.spawned > this.capacity;
@@ -1375,6 +1446,8 @@ export class Horde {
 
   takeGold() { const g = this.pendingGold; this.pendingGold = 0; return g; }
   takeLeaks() { const l = this.pendingLeaks; this.pendingLeaks = 0; return l; }
+  takeSaved() { const s = this.pendingSaved; this.pendingSaved = 0; return s; }
+  takeLost() { const l = this.pendingLost; this.pendingLost = 0; return l; }
 
   // Weapons are flat shapes, not turrets: one turret can contribute several
   // (a bouncing beam sends one segment per leg).

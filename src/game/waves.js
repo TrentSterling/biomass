@@ -1,12 +1,42 @@
 // Waves ramp headcount first and health second, because the count is the whole
 // point of the game.
 
-import { ZOMBIE_TYPES } from '../config.js';
+import {
+  ZOMBIE_TYPES, SURVIVOR, SURVIVOR_TYPE, GRID_W, GRID_H, CELL_SCALE,
+} from '../config.js';
 
 // Build phase between waves, like the original: the wave does not start until
 // the player says so. Calling it early pays a bounty, so there is a reason to
 // press the button instead of idling.
 const RUSH_BONUS_PER_SEC = 8;
+
+// Two groups of survivors per wave, timed off the wave clock rather than the
+// zombie drip: they show up whether or not that wave's composition has
+// finished spawning.
+const SURVIVOR_SCHEDULE = [6, 18];   // seconds into the wave
+const SURVIVORS_PER_GROUP = 5;
+
+// Random OPEN cell hugging the play area's border, on three of its four sides
+// (left/top/bottom -- the reference layout keeps the right side clear for the
+// camera's default framing). One authored cell in from the rock ring that
+// wraps every map, so a survivor is never born a cell away from solid geometry
+// -- it can still get nudged by horde.js's own spawn-guard (never hatch inside
+// rock), but it should not need to.
+function edgeCells(field) {
+  const m = CELL_SCALE;
+  const cells = [];
+  const yTop = GRID_H - m - 1;
+  const yBot = m;
+  const xLeft = m;
+  for (let x = m; x < GRID_W - m; x++) {
+    if (!field.isWall(x, yTop)) cells.push({ x: x + 0.5, y: yTop + 0.5 });
+    if (!field.isWall(x, yBot)) cells.push({ x: x + 0.5, y: yBot + 0.5 });
+  }
+  for (let y = m; y < GRID_H - m; y++) {
+    if (!field.isWall(xLeft, y)) cells.push({ x: xLeft + 0.5, y: y + 0.5 });
+  }
+  return cells;
+}
 
 // The reference throws 100k+ zombies at you in its late waves, and difficulty comes
 // from bodies rather than from health bars. So the count grows hard and health
@@ -42,6 +72,12 @@ export class Waves {
     this.portal = 0;
     this.hpScale = 1;
     this.speedScale = 1;
+    // Survivor groups: timed independently of the zombie drip above, and of
+    // build/running state, so 18s-in still lands even on a short early wave.
+    this.waveTime = 0;
+    this.survivorSchedule = [];
+    this.survivorAnnounced = false;
+    this.onSurvivors = null;    // () => void, wired by main.js for the toast
   }
 
   reset() {
@@ -52,6 +88,9 @@ export class Waves {
     this.portal = 0;
     this.hpScale = 1;
     this.speedScale = 1;
+    this.waveTime = 0;
+    this.survivorSchedule = [];
+    this.survivorAnnounced = false;
   }
 
   get remaining() {
@@ -69,6 +108,9 @@ export class Waves {
     this.speedScale = 1 + (this.wave - 1) * 0.035;
     this.active = composition(this.wave).map((e) => ({ ...e, acc: 0 }));
     this.state = 'running';
+    this.waveTime = 0;
+    this.survivorSchedule = SURVIVOR_SCHEDULE.map((at) => ({ at, count: SURVIVORS_PER_GROUP }));
+    this.survivorAnnounced = false;
     return true;
   }
 
@@ -77,7 +119,42 @@ export class Waves {
     return this.state === 'build' ? Math.round(Math.max(0, this.timer) * RUSH_BONUS_PER_SEC) : 0;
   }
 
+  // Test/debug hook: drop a survivor group right now, bypassing wave timing
+  // entirely. tools/*.mjs uses this so a CDP scenario does not have to wait on
+  // the natural 6s/18s schedule to get a deterministic read on saved/lost.
+  spawnSurvivorsNow(count = SURVIVORS_PER_GROUP) {
+    this.#spawnSurvivors(count);
+  }
+
+  #spawnSurvivors(count) {
+    const cells = edgeCells(this.field);
+    if (!cells.length) return;          // degenerate map: nothing to do
+    const c = cells[Math.floor(Math.random() * cells.length)];
+    this.horde.spawn(count, {
+      pos: c, hp: SURVIVOR.hp, type: SURVIVOR_TYPE, speed: SURVIVOR.speed,
+      gold: SURVIVOR.gold, scale: SURVIVOR.scale, spread: 1.4,
+    });
+  }
+
   update(dt) {
+    // Survivor groups tick regardless of build/running state: a group timed
+    // for 18s into the wave must still land even if that wave's own zombie
+    // drip (composition()'s dur) already finished and flipped state to
+    // 'build'.
+    if (this.wave > 0) {
+      this.waveTime += dt;
+      for (let i = this.survivorSchedule.length - 1; i >= 0; i--) {
+        const s = this.survivorSchedule[i];
+        if (this.waveTime < s.at) continue;
+        this.survivorSchedule.splice(i, 1);
+        this.#spawnSurvivors(s.count);
+        if (!this.survivorAnnounced) {
+          this.survivorAnnounced = true;
+          this.onSurvivors?.();
+        }
+      }
+    }
+
     if (this.state === 'build') {
       this.timer -= dt;                 // counts down for the rush bonus only
       return;

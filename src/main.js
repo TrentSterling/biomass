@@ -19,7 +19,7 @@ import { Menu } from './menu.js';
 import { startAudio, resumeAudio, configureAudio, toggleMute, isMuted, sfx } from './audio.js';
 import {
   GRID_W, GRID_H, MAX_ZOMBIES, BUILDS, BASE_HP, START_GOLD, ZOMBIE_TYPES, PARAMS, SPAWN_BATCH,
-  DENS_W, DENS_H, DENS_SCALE, ABILITIES, SPEEDS, zombieRadius,
+  DENS_W, DENS_H, DENS_SCALE, ABILITIES, SPEEDS, zombieRadius, SURVIVOR_REWARD,
 } from './config.js';
 
 // No ?map= means the title screen: the game still boots and plays itself behind
@@ -105,6 +105,7 @@ const build = new Build(field, ground, horde, () => refreshField(), meta);
 build.onRampartLost = () => { hud.toast('a rampart has fallen'); sfx.leak(); };
 build.addCharge = addCharge;
 const waves = new Waves(field, horde);
+waves.onSurvivors = () => hud.toast('survivors incoming');
 
 // A rebake rewrites field.flow in place, so the GPU just needs the upload flag.
 const refreshField = () => {
@@ -156,6 +157,7 @@ async function resetRun() {
   audioState.kills = 0;
   audioState.blasts = 0;
   audioState.wave = 0;
+  audioState.lastLostToast = -999;
   await horde.reset();
   state.hp = BASE_HP;
   state.gold = START_GOLD;
@@ -661,6 +663,7 @@ hud.ready();
 globalThis.__biomass = () => ({
   frames, time: state.time, alive: horde.stats.alive, spawned: horde.stats.spawned,
   kills: horde.stats.kills, leaks: horde.stats.leaks, gold: state.gold,
+  saved: horde.stats.saved ?? 0, lost: horde.stats.lost ?? 0,
   turrets: build.turrets.length, blasts: build.blasts.length,
   muzzles: horde._muzzleCount ?? 0, bulletCursor: horde._bulletCursor ?? 0,
   bulletHits: horde.stats.hits ?? 0, stuck: horde.stats.stuck ?? -1,
@@ -817,6 +820,11 @@ globalThis.__biomassAbility = (name, x, y) => {
   return build.fireAbility(a, { x, y }, { x: 1, y: 0 });
 };
 
+// Test hook: drop a survivor group right now, bypassing the wave clock, so a
+// CDP scenario gets a deterministic saved/lost read instead of waiting on the
+// natural 6s/18s-into-the-wave schedule.
+globalThis.__biomassSurvivors = (n) => { waves.spawnSurvivorsNow(n); return true; };
+
 // Test hook: mean distance from every currently-alive zombie to a point.
 // Cheap and fine for a single reading, but NOT for comparing two readings
 // taken seconds apart in sandbox/bench mode: zombies constantly leak into the
@@ -944,7 +952,7 @@ function step(now) {
 
   hud.update({
     hp: state.hp, hpMax: state.hpMax, gold: state.gold,
-    alive: horde.stats.alive, kills: horde.stats.kills,
+    alive: horde.stats.alive, kills: horde.stats.kills, saved: horde.stats.saved ?? 0,
     wave: waves.wave, mapName: `${field.name}${BENCH ? '  [BENCH]' : ''}${isAutoplay() ? '  [AUTOPLAY]' : ''}`,
     waveText: waveText(),
     fps, ms: msAvg, computeMs, renderMs, speed: simSpeed, muted: isMuted(), banner: bannerText(),
@@ -984,6 +992,21 @@ function tick(dt) {
       if (state.hp <= 0) endRun(false);
     }
 
+    // Survivors: gold same as any other kill-adjacent income, unconditional --
+    // matches how takeGold() above is never gated by BENCH/sandbox either.
+    const saved = horde.takeSaved();
+    if (saved) {
+      state.gold += saved * SURVIVOR_REWARD;
+      hud.toast(saved > 1
+        ? `${saved} survivors saved, +${saved * SURVIVOR_REWARD}g`
+        : `survivor saved, +${SURVIVOR_REWARD}g`);
+    }
+    const lost = horde.takeLost();
+    if (lost && state.time - audioState.lastLostToast > 3) {
+      hud.toast('a survivor was eaten');
+      audioState.lastLostToast = state.time;
+    }
+
     // Held every wave up to the target: that is a win.
     if (!BENCH && !attract && waves.wave >= TARGET_WAVES && waves.state === 'build') endRun(true);
 
@@ -1002,7 +1025,7 @@ function tick(dt) {
   }
 }
 
-const audioState = { kills: 0, blasts: 0, wave: 0 };
+const audioState = { kills: 0, blasts: 0, wave: 0, lastLostToast: -999 };
 
 function waveText() {
   if (state.sandbox && !BENCH) return 'SANDBOX (G to arm base)';

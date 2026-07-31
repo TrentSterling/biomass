@@ -11,6 +11,7 @@ export class Hud {
       hud: $('hud'), boot: $('boot'), bootmsg: $('bootmsg'),
       hpfill: $('hpfill'), hptext: $('hptext'),
       gold: $('c-gold'), zombies: $('c-zombies'), kills: $('c-kills'), towers: $('c-towers'),
+      saved: $('c-saved'),
       waveN: $('w-n'), waveS: $('w-s'), waveMap: $('w-map'),
       speed: $('w-speed'), banner: $('banner'),
       fps: $('b-fps'), ms: $('b-ms'), compute: $('b-compute'), render: $('b-render'),
@@ -81,6 +82,7 @@ export class Hud {
     e.zombies.textContent = fmt(s.alive);
     e.kills.textContent = fmt(s.kills);
     e.towers.textContent = String(s.towers);
+    e.saved.textContent = fmt(s.saved ?? 0);
 
     e.waveN.textContent = s.wave;
     e.waveS.textContent = s.waveText;

@@ -169,6 +169,25 @@ export const ZOMBIE_TYPES = [
   { name: 'crawler',  hp: 5,   speed: 5.2, gold: 1, scale: 0.38 },
 ];
 
+// Survivors: durable, edible, worth saving. They live in the SAME GPU buffers
+// as the horde (pos/dat/att), just tagged with a type index past the last
+// hostile ZOMBIE_TYPES entry, so every contact/steering/render system that
+// already iterates "every alive body" picks them up for free. Kept out of
+// ZOMBIE_TYPES itself: nothing that iterates that array (waves.composition,
+// the stress/flood test spawners) should ever accidentally pick one up.
+//
+// Hostile vs survivor on the GPU is one float compare against 4.5 -- cheaper
+// than a lookup, and it already reads that way at the one gate that existed
+// before this stage (movePass's bait-charge filter).
+export const SURVIVOR_TYPE = 5;                 // atlas tile 5 (art.js)
+export const SURVIVOR = { hp: 320, speed: 4.6, gold: 0, scale: 0.52 };
+// Damage per second a single hostile pressed against a survivor deals. Tallied
+// as a touching-neighbour count in horde.js's relaxPass, applied once a frame
+// in simPass -- see corr.z.
+export const SURVIVOR_CHEW_DPS = 5;
+// Gold paid out per survivor that reaches the base alive.
+export const SURVIVOR_REWARD = 15;
+
 // Rampart footprint in sim cells: half an authored block, so a 4-cell corridor
 // can be narrowed to 2 instead of only being sealed.
 export const RAMPART = 2;
