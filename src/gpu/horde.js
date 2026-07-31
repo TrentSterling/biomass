@@ -79,7 +79,10 @@ export class Horde {
     // hit budget refilled each frame (weapons first, blasts after them). Without
     // that budget, area damage grows with crowd density and a bigger horde just
     // feeds the turrets.
-    const CNT_BUDGET = 6;   // 0-3 monotonic, 4 stuck gauge, 5 spare
+    // 0-3 monotonic, 4 stuck gauge, 5 travel-capped, 6 outside the world,
+    // 7 still inside rock after resolution. 6 and 7 are the self-check: both must
+    // be zero, and the HUD turns them red the moment they are not.
+    const CNT_BUDGET = 8;
     const cnt = instancedArray(CNT_BUDGET + MAX_TURRETS + MAX_BLASTS, 'uint').toAtomic();
     const budgetAt = (i) => i.add(int(CNT_BUDGET));
     this._buffers = { pos, dat, att, dens, bucket, bullets, cnt };
@@ -191,6 +194,80 @@ export class Horde {
       return textureLoad(flowTex, ivec2(cx, cy)).z.greaterThan(0.5);
     };
 
+    // Nearest open cell centre within R cells. Returns the point unchanged when
+    // the whole neighbourhood is solid, so callers must tolerate that.
+    const nearestOpen = (q, R) => {
+      const best = float(1e9).toVar();
+      const ox = q.x.toVar();
+      const oy = q.y.toVar();
+      const bx = floor(q.x).toVar();
+      const by = floor(q.y).toVar();
+      for (let dy = -R; dy <= R; dy++) {
+        for (let dx = -R; dx <= R; dx++) {
+          const ccx = bx.add(float(dx)).add(0.5).toVar();
+          const ccy = by.add(float(dy)).add(0.5).toVar();
+          If(isRock(vec2(ccx, ccy)).not(), () => {
+            const dd = length(vec2(ccx.sub(q.x), ccy.sub(q.y))).toVar();
+            If(dd.lessThan(best), () => { best.assign(dd); ox.assign(ccx); oy.assign(ccy); });
+          });
+        }
+      }
+      return vec2(ox, oy);
+    };
+
+    // Project a body out of every rock cell its CIRCLE overlaps, rather than
+    // asking whether its centre point happens to sit in one.
+    //
+    // A centre test ignores the body's radius entirely, so a zombie centred a
+    // hair outside a wall had its whole 0.22 body buried in it: that is the neat
+    // one-cell band of bodies lining the inside of every platform. It also lets
+    // a body cut corners, because a per-axis test can pass on x and pass on y
+    // while the diagonal destination it actually moves to is solid.
+    //
+    // Cells are unit squares on integer boundaries, so the closest point on a
+    // cell is just a clamp, and circle-vs-box is exact.
+    const pushOutOfRock = (p) => {
+      const out = p.toVar();
+      const r = float(ZOMBIE_RADIUS);
+
+      If(isRock(out), () => {
+        // CENTRE INSIDE GEOMETRY. Resolve by ejection only, never by overlap.
+        //
+        // Running the overlap pushes in this case was actively harmful: the
+        // solid cells all around shoved the body from several sides at once,
+        // the pushes cancelled, and it sat pinned in place while the escape
+        // field was trying to walk it out. Two systems fighting, and the body
+        // never moved further than a twentieth of a unit a second.
+        //
+        // The search is wide because platforms are wide: a body at the middle
+        // of the central slab on TWIN GATES is fifteen cells from daylight, and
+        // a short search finds nothing but more rock and gives up.
+        out.assign(nearestOpen(out, 8));
+      }).Else(() => {
+        // Centre is in the open, so every solid cell nearby is a genuine
+        // circle-vs-box contact with a well defined normal. Cells are unit
+        // squares on integer boundaries, so the closest point is a clamp.
+        const bx = floor(out.x).toVar();
+        const by = floor(out.y).toVar();
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const cx = bx.add(float(ox)).toVar();
+            const cy = by.add(float(oy)).toVar();
+            If(isRock(vec2(cx.add(0.5), cy.add(0.5))), () => {
+              const qx = clamp(out.x, cx, cx.add(1)).toVar();
+              const qy = clamp(out.y, cy, cy.add(1)).toVar();
+              const d = vec2(out.x.sub(qx), out.y.sub(qy)).toVar();
+              const dist = length(d).toVar();
+              If(dist.greaterThan(float(1e-5)).and(dist.lessThan(r)), () => {
+                out.addAssign(d.mul(r.sub(dist).div(dist)));
+              });
+            });
+          }
+        }
+      });
+      return out;
+    };
+
     // Crowd separation from the coarse density grid: push down the gradient of
     // "how many neighbours are over there". Cheap stand-in for pair collisions
     // and it produces the nose-to-tail river look.
@@ -224,7 +301,26 @@ export class Horde {
         const s2 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(9871))).toVar();
         const s3 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(31337))).toVar();
         const off = vec2(s1.sub(0.5), s2.sub(0.5)).mul(u.spawnSpread.mul(2));
-        pos.element(slot).assign(vec4(u.spawnPos.add(off), 0, 0));
+
+        // NEVER hatch a body inside rock.
+        //
+        // Bodies born inside a slab have no open face for the wall solver to
+        // push them through, so they stay there for the entire run: they never
+        // walked in, they were placed there and could not leave.
+        //
+        // Move to the nearest open cell, NOT back toward the spawn centre. The
+        // centre is not guaranteed to be open: the flood tool spawns everything
+        // at the middle of the map, and on a map with a central platform that
+        // point is solid rock, so shrinking toward it stacked every rejected
+        // body onto one buried spot. That is a tighter, more permanent clump
+        // than the scatter it replaced.
+        const at = vec2(
+          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS), float(GRID_W).sub(ZOMBIE_RADIUS)),
+          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS), float(GRID_H).sub(ZOMBIE_RADIUS)),
+        ).toVar();
+        If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
+
+        pos.element(slot).assign(vec4(at, 0, 0));
         dat.element(slot).assign(vec4(u.spawnHp, u.spawnType, s3, 0));
         att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale));
       });
@@ -256,7 +352,26 @@ export class Horde {
         const s2 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(9871))).toVar();
         const s3 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(31337))).toVar();
         const off = vec2(s1.sub(0.5), s2.sub(0.5)).mul(u.spawnSpread.mul(2));
-        pos.element(slot).assign(vec4(u.spawnPos.add(off), 0, 0));
+
+        // NEVER hatch a body inside rock.
+        //
+        // Bodies born inside a slab have no open face for the wall solver to
+        // push them through, so they stay there for the entire run: they never
+        // walked in, they were placed there and could not leave.
+        //
+        // Move to the nearest open cell, NOT back toward the spawn centre. The
+        // centre is not guaranteed to be open: the flood tool spawns everything
+        // at the middle of the map, and on a map with a central platform that
+        // point is solid rock, so shrinking toward it stacked every rejected
+        // body onto one buried spot. That is a tighter, more permanent clump
+        // than the scatter it replaced.
+        const at = vec2(
+          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS), float(GRID_W).sub(ZOMBIE_RADIUS)),
+          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS), float(GRID_H).sub(ZOMBIE_RADIUS)),
+        ).toVar();
+        If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
+
+        pos.element(slot).assign(vec4(at, 0, 0));
         dat.element(slot).assign(vec4(u.spawnHp, u.spawnType, s3, 0));
         att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale));
       });
@@ -338,16 +453,31 @@ export class Horde {
       If(dat.element(i).x.lessThanEqual(0), () => { Return(); });
       const P = pos.element(i).toVar();
       const to = P.xy.add(corr.element(i)).toVar();
-      // never let a correction shove a body into rock
-      const okX = to.x.toVar();
-      const okY = to.y.toVar();
-      If(isRock(P.xy), () => {
-        // already buried: let it climb out along the escape field
-      }).Else(() => {
-        If(isRock(vec2(okX, P.y)), () => { okX.assign(P.x); });
-        If(isRock(vec2(P.x, okY)), () => { okY.assign(P.y); });
+      // Contacts first, then geometry: a body squeezed by the crowd ends the
+      // step outside the wall rather than inside it.
+      const fixed = pushOutOfRock(to).toVar();
+
+      // HARD WORLD BOUNDS. Nothing may exist off the board.
+      //
+      // isRock and flowAt both CLAMP their texture lookups, so a body outside
+      // the map reads the edge cell's data for ever: it is outside physics and
+      // outside pathing at once, and nothing can tell it to come back. The flood
+      // tool was scattering bodies to y = -17 on a board that starts at 0, and
+      // they simply stayed there for the rest of the run.
+      const lim = float(ZOMBIE_RADIUS);
+      const bounded = vec2(
+        clamp(fixed.x, lim, float(GRID_W).sub(lim)),
+        clamp(fixed.y, lim, float(GRID_H).sub(lim)),
+      ).toVar();
+
+      // Self-check. These are the two states the sim claims are impossible, so
+      // they get counted rather than assumed.
+      If(length(bounded.sub(fixed)).greaterThan(float(1e-4)), () => {
+        atomicAdd(cnt.element(6), uint(1));
       });
-      pos.element(i).assign(vec4(okX, okY, P.z, P.w));
+      If(isRock(bounded), () => { atomicAdd(cnt.element(7), uint(1)); });
+
+      pos.element(i).assign(vec4(bounded, P.z, P.w));
     })().compute(MAX_ZOMBIES);
 
     // ---- pass: finish ------------------------------------------------------
@@ -490,13 +620,28 @@ export class Horde {
       // No bounce term on rejection any more: velocity is derived downstream
       // from how far the body actually got, so a blocked axis produces zero
       // speed on its own.
+      // Prevention as well as resolution. applyPass can now dig a body out of a
+      // wall it ended up inside, but not letting it in is cheaper and steadier,
+      // and the margin is thin: travel is capped near 0.9 of a radius while the
+      // wall standoff is one radius, so a single crowd shove on top of a normal
+      // step is enough to put a centre through a face.
+      //
+      // The DIAGONAL destination is tested, not just each axis on its own. Two
+      // per-axis tests can both pass while the corner they move through is
+      // solid, which is how bodies used to appear inside platforms with no path
+      // in.
       const nx = p.x.add(v.x.mul(u.h)).toVar();
       const ny = p.y.add(v.y.mul(u.h)).toVar();
       If(isRock(p), () => {
-        // buried: follow the escape direction freely
+        // already buried: follow the escape field out, unimpeded
       }).Else(() => {
-        If(isRock(vec2(nx, p.y)), () => { nx.assign(p.x); });
-        If(isRock(vec2(p.x, ny)), () => { ny.assign(p.y); });
+        If(isRock(vec2(nx, ny)), () => {
+          // slide along whichever axis stays in open ground
+          If(isRock(vec2(nx, p.y)), () => { nx.assign(p.x); });
+          If(isRock(vec2(p.x, ny)), () => { ny.assign(p.y); });
+          // both blocked: the corner itself. Stay put and let contacts sort it.
+          If(isRock(vec2(nx, ny)), () => { nx.assign(p.x); ny.assign(p.y); });
+        });
       });
       pos.element(i).assign(vec4(nx, ny, v));
     })().compute(MAX_ZOMBIES);
@@ -718,6 +863,9 @@ export class Horde {
       for (let k = 0; k < BUCKET_K; k++) {
         bucket.element(base.add(uint(k))).assign(uint(0));
       }
+      If(instanceIndex.lessThan(uint(2)), () => {
+        atomicStore(cnt.element(instanceIndex.add(uint(6))), uint(0));
+      });
       If(instanceIndex.lessThan(uint(MAX_TURRETS + MAX_BLASTS)), () => {
         atomicStore(cnt.element(instanceIndex.add(uint(CNT_BUDGET))), uint(0));
       });
@@ -963,6 +1111,11 @@ export class Horde {
       this.stats.hits = c[3];
       // stuck zombie-frames since the last readback, so it reads as a rate
       this.stats.stuck = Math.max(0, c[4] - this._lastStuck);
+      // Not monotonic: these are a census of the last substep, so they read
+      // directly. Either being nonzero means a body is somewhere the sim says
+      // is impossible.
+      this.stats.oob = c[6] ?? 0;
+      this.stats.inRock = c[7] ?? 0;
       this._lastStuck = c[4];
       this.pendingGold += dGold;
       this.pendingLeaks += dLeaks;

@@ -397,7 +397,9 @@ function flood(count = Math.floor(MAX_ZOMBIES / 2)) {
   for (let i = 0; i < batches; i++) {
     horde.spawn(SPAWN_BATCH, {
       pos: centre, hp: t.hp * 4, type: 0, speed: t.speed,
-      gold: t.gold, scale: t.scale, spread: Math.max(GRID_W, GRID_H) / 2,
+      // Sized to the SHORTER axis. max() overshot the board by twenty units on
+      // the short side, and every body it threw past the edge was gone for good.
+      gold: t.gold, scale: t.scale, spread: Math.min(GRID_W, GRID_H) / 2 - 1,
     });
   }
   hud.toast(`flooding ${batches * SPAWN_BATCH} zombies`);
@@ -624,6 +626,7 @@ globalThis.__biomass = () => ({
   turrets: build.turrets.length, blasts: build.blasts.length,
   muzzles: horde._muzzleCount ?? 0, bulletCursor: horde._bulletCursor ?? 0,
   bulletHits: horde.stats.hits ?? 0, stuck: horde.stats.stuck ?? -1,
+  oob: horde.stats.oob ?? -1, inRock: horde.stats.inRock ?? -1,
   baseSynced: Math.hypot(horde.u.basePos.value.x - field.base.x, horde.u.basePos.value.y - field.base.y) < 0.01,
   map: mapIndex,
   hp: state.hp, over: state.over, won: state.won, sandbox: state.sandbox,
@@ -650,6 +653,106 @@ globalThis.__biomassPerf = () => ({
   renderMs: renderMs != null ? +renderMs.toFixed(3) : null,
   substeps: horde.substeps, iterations: horde.iterations,
 });
+
+// How many living zombies have any part of their body inside rock.
+//
+// The number Salman asked for, and the one a centre-point wall test could never
+// report honestly: a body centred just outside a wall passes a centre test while
+// being visibly buried, which is what produced the band of zombies lining every
+// platform edge. This measures circle-vs-cell overlap, the same way the solver
+// now resolves it.
+globalThis.__biomassEmbedded = async () => {
+  const R = 0.22;
+  const posBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.pos.value));
+  const datBuf = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.dat.value));
+  const n = Math.min(horde.used ?? 0, datBuf.length / 4);
+  const { walls, w, h } = field;
+  let alive = 0; let embedded = 0; let deep = 0;
+  const deepAt = [];
+  for (let i = 0; i < n; i++) {
+    if (datBuf[i * 4] <= 0) continue;
+    alive++;
+    const x = posBuf[i * 4]; const y = posBuf[i * 4 + 1];
+    const bx = Math.floor(x); const by = Math.floor(y);
+    let worst = 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const cx = bx + ox; const cy = by + oy;
+        if (cx < 0 || cy < 0 || cx >= w || cy >= h) continue;
+        if (!walls[cy * w + cx]) continue;
+        const qx = Math.min(Math.max(x, cx), cx + 1);
+        const qy = Math.min(Math.max(y, cy), cy + 1);
+        const d = Math.hypot(x - qx, y - qy);
+        if (d < R) worst = Math.max(worst, R - d);
+      }
+    }
+    if (worst > 0.01) embedded++;
+    if (worst >= R) {
+      deep++;                            // centre itself inside the slab
+      if (deepAt.length < 400) deepAt.push({ x: +x.toFixed(2), y: +y.toFixed(2) });
+    }
+  }
+  return {
+    alive,
+    embedded,
+    embeddedPct: alive ? +((embedded / alive) * 100).toFixed(2) : 0,
+    deep,
+    // Where are they? A count alone cannot tell you whether these are bodies
+    // that walked in or bodies that were placed there.
+    samples: deepAt.slice(0, 8),
+    nearSpawn: deepAt.filter((s2) => Math.hypot(s2.x - field.spawns[0].x, s2.y - field.spawns[0].y) < 4).length,
+    nearBase: deepAt.filter((s2) => Math.hypot(s2.x - field.base.x, s2.y - field.base.y) < 4).length,
+    spawn: { x: +field.spawns[0].x.toFixed(2), y: +field.spawns[0].y.toFixed(2) },
+    spawnInRock: !!walls[Math.floor(field.spawns[0].y) * w + Math.floor(field.spawns[0].x)],
+  };
+};
+
+// Find bodies that are not making progress, and say WHY. A count of stalls tells
+// you something is wrong; this tells you where they are, what the ground under
+// them is, and what the flow field is asking them to do there.
+globalThis.__biomassStuck = async (ms = 1500) => {
+  const snap = async () => Float32Array.from(
+    new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.pos.value)));
+  const dat = new Float32Array(await horde.renderer.getArrayBufferAsync(horde._buffers.dat.value));
+  const a = await snap();
+  await new Promise((r) => setTimeout(r, ms));
+  const b = await snap();
+
+  const n = Math.min(horde.used ?? 0, dat.length / 4);
+  const { walls, w, h, cost, flow } = field;
+  const stuck = [];
+  let alive = 0;
+  for (let i = 0; i < n; i++) {
+    if (dat[i * 4] <= 0) continue;
+    alive++;
+    const x = b[i * 4]; const y = b[i * 4 + 1];
+    const moved = Math.hypot(x - a[i * 4], y - a[i * 4 + 1]);
+    if (moved > 0.35) continue;                        // making progress
+    const cx = Math.floor(x); const cy = Math.floor(y);
+    const ci = cy * w + cx;
+    stuck.push({
+      x: +x.toFixed(2), y: +y.toFixed(2), moved: +moved.toFixed(3),
+      rock: !!walls[ci],
+      cost: Number.isFinite(cost[ci]) ? +cost[ci].toFixed(1) : 'UNREACHABLE',
+      // the baked heading at that cell, decoded from the texture
+      dir: [+((flow[ci * 4] / 255) * 2 - 1).toFixed(2), +((flow[ci * 4 + 1] / 255) * 2 - 1).toFixed(2)],
+      distToBase: +Math.hypot(x - field.base.x, y - field.base.y).toFixed(1),
+    });
+  }
+  // group them so a clump reads as one entry rather than four hundred
+  const clumps = [];
+  for (const s2 of stuck) {
+    const near = clumps.find((c) => Math.hypot(c.x - s2.x, c.y - s2.y) < 3);
+    if (near) { near.count++; } else { clumps.push({ ...s2, count: 1 }); }
+  }
+  clumps.sort((p1, p2) => p2.count - p1.count);
+  return {
+    alive,
+    stuck: stuck.length,
+    stuckPct: alive ? +((stuck.length / alive) * 100).toFixed(2) : 0,
+    clumps: clumps.slice(0, 6),
+  };
+};
 
 globalThis.__biomassSolver = (substeps, iterations) => {
   if (substeps) horde.substeps = substeps;
