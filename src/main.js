@@ -639,6 +639,18 @@ globalThis.__biomass = () => ({
 // travel, and a large ratio means bodies are vibrating on the spot. The old
 // solver could sit at 3-4 while looking completely stalled, because it assigned
 // velocity from the flow field regardless of whether the zombie could move.
+// Scale benchmark hooks: pour zombies in and read the cost back out.
+globalThis.__biomassStress = (n) => { stress(n); return horde.stats.spawned; };
+globalThis.__biomassPerf = () => ({
+  alive: horde.stats.alive,
+  drawn: horde.used ?? 0,
+  fps: +fps.toFixed(1),
+  frameMs: +msAvg.toFixed(2),
+  computeMs: computeMs != null ? +computeMs.toFixed(3) : null,
+  renderMs: renderMs != null ? +renderMs.toFixed(3) : null,
+  substeps: horde.substeps, iterations: horde.iterations,
+});
+
 globalThis.__biomassSolver = (substeps, iterations) => {
   if (substeps) horde.substeps = substeps;
   if (iterations) horde.iterations = iterations;
