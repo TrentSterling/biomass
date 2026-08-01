@@ -3,7 +3,12 @@
 
 import {
   ZOMBIE_TYPES, SURVIVOR, SURVIVOR_TYPE, GRID_W, GRID_H, CELL_SCALE,
+  BOSS, bossCountFor,
 } from '../config.js';
+
+// Bosses arrive as singles on a slow drumbeat rather than in the drip streams:
+// each one is an event, not a stream.
+const BOSS_DRIP_SECONDS = 3;
 
 // Build phase between waves, like the original: the wave does not start until
 // the player says so. Calling it early pays a bounty, so there is a reason to
@@ -78,6 +83,9 @@ export class Waves {
     this.survivorSchedule = [];
     this.survivorAnnounced = false;
     this.onSurvivors = null;    // () => void, wired by main.js for the toast
+    this.bossPending = 0;
+    this.bossAcc = 0;
+    this.onBoss = null;         // () => void, wired by main.js for the toast
   }
 
   reset() {
@@ -91,6 +99,8 @@ export class Waves {
     this.waveTime = 0;
     this.survivorSchedule = [];
     this.survivorAnnounced = false;
+    this.bossPending = 0;
+    this.bossAcc = 0;
   }
 
   get remaining() {
@@ -126,6 +136,10 @@ export class Waves {
     this.waveTime = 0;
     this.survivorSchedule = SURVIVOR_SCHEDULE.map((at) => ({ at, count: SURVIVORS_PER_GROUP }));
     this.survivorAnnounced = false;
+    // Bosses join from BOSS_FROM_WAVE (config.js), a slow single-file drip on
+    // top of the streams. hp compounds on the same curve as everything else.
+    this.bossPending = bossCountFor(this.wave);
+    this.bossAcc = 0;
     return true;
   }
 
@@ -176,6 +190,23 @@ export class Waves {
     }
     if (this.state !== 'running') return;
 
+    if (this.bossPending > 0) {
+      this.bossAcc += dt;
+      if (this.bossAcc >= BOSS_DRIP_SECONDS) {
+        this.bossAcc -= BOSS_DRIP_SECONDS;
+        this.bossPending--;
+        const portal = this.field.spawns[this.portal++ % this.field.spawns.length];
+        this.horde.spawnBosses(1, {
+          pos: portal,
+          hp: BOSS.hp * this.hpScale,
+          speed: BOSS.speed * this.speedScale,
+          gold: BOSS.gold,
+          spread: 1.2,
+        });
+        this.onBoss?.();
+      }
+    }
+
     for (const e of this.active) {
       if (e.count <= 0) continue;
       e.acc += (e.count0 ?? (e.count0 = e.count)) / e.dur * dt;
@@ -196,7 +227,10 @@ export class Waves {
       });
     }
 
-    if (this.active.every((e) => e.count <= 0)) {
+    // A wave is not over while a boss is still owed: flipping to 'build' with
+    // bossPending > 0 would strand the tail of the drip in a state update()
+    // returns out of.
+    if (this.bossPending <= 0 && this.active.every((e) => e.count <= 0)) {
       this.state = 'build';
       this.timer = 20;                  // full rush bonus if called immediately
     }

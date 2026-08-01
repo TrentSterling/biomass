@@ -33,6 +33,9 @@ import {
   BULLET_PIERCE_COST, BULLET_BLAST, BULLET_BLAST_MULT,
   MAX_BULLETS, MAX_MUZZLES, MUZZLE_BURST, BULLET_SPEED, BULLET_LIFE,
   SURVIVOR_CHEW_DPS, SURVIVOR,
+  MAX_BOSSES, BOSS_SPAWN_BATCH, BOSS_RADIUS, BOSS_RENDER_JITTER,
+  BOSS_GRID_CELL, BOSS_GRID_W, BOSS_GRID_H, BOSS_BUCKET_K, BOSS_REACH,
+  BOSS_CHEW_WEIGHT, BOSS_AIM_WEIGHT,
 } from '../config.js';
 
 // The quickest body the substep count has to keep up with. SURVIVOR is kept
@@ -44,7 +47,7 @@ import {
 const MAX_SPEED_GUESS = Math.max(...ZOMBIE_TYPES.map((t) => t.speed), SURVIVOR.speed);
 
 export class Horde {
-  constructor(renderer, flowTexture, atlasTexture, basePos) {
+  constructor(renderer, flowTexture, atlasTexture, bossTexture, basePos) {
     this.renderer = renderer;
     this.capacity = MAX_ZOMBIES;
     this.cursor = 0;
@@ -110,7 +113,10 @@ export class Horde {
     // 7 still inside rock after resolution. 6 and 7 are the self-check: both must
     // be zero, and the HUD turns them red the moment they are not.
     // 9 survivors saved, 10 survivors lost -- monotonic, same as 0-3.
-    const CNT_BUDGET = 11;   // 8 = neighbours the hash had to drop
+    // 11 boss leaks, 12 boss kills -- monotonic. Bosses keep their own pair
+    // rather than sharing 0/1 because a boss leak damages the base ten times
+    // harder and a boss kill is not a zombie kill on the HUD.
+    const CNT_BUDGET = 13;   // 8 = neighbours the hash had to drop
     const cnt = instancedArray(CNT_BUDGET + MAX_TURRETS + MAX_BLASTS, 'uint').toAtomic();
     const budgetAt = (i) => i.add(int(CNT_BUDGET));
     this._buffers = { pos, dat, att, dens, hostileDens, bucket, bullets, cnt };
@@ -138,8 +144,42 @@ export class Horde {
       bulletSpread: uniform(0.1),
       muzzleCount: uniform(0, 'int'),
       chargeCount: uniform(0, 'int'),
+      // How many boss slots have ever been used. Doubles as the branch guard
+      // that keeps the boss gather in the zombie kernel completely dark until
+      // the first boss exists, so a bossless run pays nothing new.
+      bossCount: uniform(0, 'int'),
     };
     this.u = u;
+
+    // ---- boss pool ---------------------------------------------------------
+    // Bosses NEVER enter the fine hash (see config.js): own buffers, own
+    // coarse hash, own passes. Same slot layout as the horde where it matters:
+    //   bpos: x, y, vx, vy
+    //   bdat: hp, unused, seed, deathTime
+    //   batt: maxSpeed, goldValue, lastHitTime, renderJitter
+    const bpos = instancedArray(MAX_BOSSES, 'vec4');
+    const bdat = instancedArray(MAX_BOSSES, 'vec4');
+    const batt = instancedArray(MAX_BOSSES, 'vec4');
+    const bprev = instancedArray(MAX_BOSSES, 'vec2');
+    const bcorr = instancedArray(MAX_BOSSES, 'vec4');
+    // Coarse boss hash: cell 2 world units, BOSS_BUCKET_K slots, index+1 so
+    // zero means empty. Only ALIVE bosses are scattered, so readers need no
+    // neighbour alive-check; a boss that dies lingers at most one substep.
+    const bslots = instancedArray(BOSS_GRID_W * BOSS_GRID_H, 'uint').toAtomic();
+    const bbucket = instancedArray(BOSS_GRID_W * BOSS_GRID_H * BOSS_BUCKET_K, 'uint');
+    this._bossBuffers = { bpos, bdat, batt, bslots, bbucket };
+
+    const bu = {
+      spawnCount: uniform(0, 'int'),
+      spawnCursor: uniform(0, 'int'),
+      spawnPos: uniform(new THREE.Vector2()),
+      spawnSpread: uniform(2.5),
+      spawnHp: uniform(2600),
+      spawnSpeed: uniform(2),
+      spawnGold: uniform(90),
+      spawnSeed: uniform(0, 'int'),
+    };
+    this.bu = bu;
 
     this.turretA = uniformArray(Array.from({ length: MAX_TURRETS }, () => new THREE.Vector4()), 'vec4');
     this.turretB = uniformArray(Array.from({ length: MAX_TURRETS }, () => new THREE.Vector4()), 'vec4');
@@ -368,61 +408,6 @@ export class Horde {
       });
     })().compute(SPAWN_BATCH);
 
-    // ---- pass: init --------------------------------------------------------
-    // deathTime far in the past means "empty slot", so nothing renders at boot.
-    this.bulletClearPass = Fn(() => {
-      bullets.element(instanceIndex).assign(vec4(0, 0, 0, 0));
-    })().compute(MAX_BULLETS);
-
-    this.initPass = Fn(() => {
-      pos.element(instanceIndex).assign(vec4(0, 0, 0, 0));
-      dat.element(instanceIndex).assign(vec4(0, 0, 0, -1000));
-      att.element(instanceIndex).assign(vec4(1, 0, -1000, 0.5));
-    })().compute(MAX_ZOMBIES);
-
-    // Zeroes the monotonic counters, so a restart starts from a clean score
-    // without the CPU having to track an offset.
-    this.counterResetPass = Fn(() => {
-      atomicStore(cnt.element(instanceIndex), uint(0));
-    })().compute(CNT_BUDGET);
-
-    // ---- pass: spawn -------------------------------------------------------
-    this.spawnPass = Fn(() => {
-      If(int(instanceIndex).lessThan(u.spawnCount), () => {
-        const slot = u.spawnCursor.add(int(instanceIndex)).mod(int(MAX_ZOMBIES)).toVar();
-        const s1 = hash(instanceIndex.add(uint(u.spawnSeed))).toVar();
-        const s2 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(9871))).toVar();
-        const s3 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(31337))).toVar();
-        const off = vec2(s1.sub(0.5), s2.sub(0.5)).mul(u.spawnSpread.mul(2));
-
-        // NEVER hatch a body inside rock.
-        //
-        // Bodies born inside a slab have no open face for the wall solver to
-        // push them through, so they stay there for the entire run: they never
-        // walked in, they were placed there and could not leave.
-        //
-        // Move to the nearest open cell, NOT back toward the spawn centre. The
-        // centre is not guaranteed to be open: the flood tool spawns everything
-        // at the middle of the map, and on a map with a central platform that
-        // point is solid rock, so shrinking toward it stacked every rejected
-        // body onto one buried spot. That is a tighter, more permanent clump
-        // than the scatter it replaced.
-        const at = vec2(
-          clamp(u.spawnPos.x.add(off.x), float(ZOMBIE_RADIUS_MAX), float(GRID_W).sub(ZOMBIE_RADIUS_MAX)),
-          clamp(u.spawnPos.y.add(off.y), float(ZOMBIE_RADIUS_MAX), float(GRID_H).sub(ZOMBIE_RADIUS_MAX)),
-        ).toVar();
-        If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
-
-        pos.element(slot).assign(vec4(at, 0, 0));
-        dat.element(slot).assign(vec4(u.spawnHp, u.spawnType, s3, 0));
-        // Size jitter lives in the drawn scale, which the physics radius is
-        // derived from, so one number varies both and they can never disagree.
-        const s4 = hash(instanceIndex.add(uint(u.spawnSeed)).add(uint(5501))).toVar();
-        const jitter = float(1).add(s4.sub(0.5).mul(float(2 * SIZE_JITTER))).toVar();
-        att.element(slot).assign(vec4(u.spawnSpeed, u.spawnGold, -1000, u.spawnScale.mul(jitter)));
-      });
-    })().compute(SPAWN_BATCH);
-
     // ---- pass: scatter -----------------------------------------------------
     this.scatterPass = Fn(() => {
       const d = dat.element(instanceIndex).toVar();
@@ -536,6 +521,57 @@ export class Horde {
           }
         }
       }
+      // ---- bosses shove, zombies yield -------------------------------------
+      // One-way coupling: the boss solver never reads zombies, so this gather
+      // is the only place the two populations touch. The zombie takes the
+      // WHOLE correction (a boss is ~16x the mass; handing it a share here
+      // would also double-move it against its own solver).
+      //
+      // 2x2 cells of the coarse boss hash, anchored by the reach itself:
+      // floor((p - reach) / cell) .. floor((p + reach) / cell) spans at most
+      // two cells per axis because BOSS_REACH < one boss cell (config.js). A
+      // bilinear-style block anchored at p can miss a boss almost a full
+      // reach away on the far side of a cell boundary, which is exactly the
+      // invisible-neighbour bug the fine grid's cell-size law exists to
+      // prevent.
+      //
+      // Guarded by a uniform so a bossless run pays nothing new: every thread
+      // takes the same branch and the whole gather stays dark.
+      If(u.bossCount.greaterThan(int(0)), () => {
+        const inv = float(1 / BOSS_GRID_CELL);
+        const bx0 = int(clamp(floor(p.x.sub(float(BOSS_REACH)).mul(inv)), float(0), float(BOSS_GRID_W - 1))).toVar();
+        const by0 = int(clamp(floor(p.y.sub(float(BOSS_REACH)).mul(inv)), float(0), float(BOSS_GRID_H - 1))).toVar();
+        for (let oy = 0; oy <= 1; oy++) {
+          for (let ox = 0; ox <= 1; ox++) {
+            const bx = min(bx0.add(int(ox)), int(BOSS_GRID_W - 1)).toVar();
+            const by = min(by0.add(int(oy)), int(BOSS_GRID_H - 1)).toVar();
+            const bcell = by.mul(int(BOSS_GRID_W)).add(bx).toVar();
+            for (let k = 0; k < BOSS_BUCKET_K; k++) {
+              const raw = bbucket.element(bcell.mul(int(BOSS_BUCKET_K)).add(int(k))).toVar();
+              If(raw.greaterThan(uint(0)), () => {
+                const bq = bpos.element(raw.sub(uint(1))).xy.toVar();
+                const delta = p.sub(bq).toVar();
+                const dist = length(delta).toVar();
+                const minDist = ri.add(float(BOSS_RADIUS)).toVar();
+                If(dist.lessThan(minDist), () => {
+                  const degenerate = step(dist, float(1e-5));
+                  const ang = hash(i.add(raw).add(uint(9241))).mul(6.2831853).toVar();
+                  const n = mix(delta.div(max(dist, float(1e-5))),
+                    vec2(cos(ang), sin(ang)), degenerate).toVar();
+                  push.addAssign(n.mul(minDist.sub(dist)));
+                  hits.addAssign(1);
+                  // A boss standing on a survivor eats like a squad. Only the
+                  // survivor's own tally moves; bosses never chew hostiles.
+                  If(self.y.greaterThan(4.5), () => {
+                    chew.addAssign(float(BOSS_CHEW_WEIGHT));
+                  });
+                });
+              });
+            }
+          }
+        }
+      });
+
       // Averaged, not summed. A body with eight neighbours pushing on it must
       // move once, not eight times.
       corr.element(i).assign(vec4(push.div(max(hits, float(1))), chew, 0));
@@ -1042,6 +1078,249 @@ export class Horde {
       });
     })().compute(DENS_W * DENS_H);
 
+    // ---- boss passes -------------------------------------------------------
+    // The same solver, one size up and much simpler: no XSPH (giants are
+    // marbles, not water), no wander or sway (a colossus does not shuffle),
+    // no charges (nothing the player throws moves this much mass), and no
+    // zombie contacts at all -- coupling is strictly one-way, resolved on the
+    // zombie side in relaxPass above. Every pass early-outs on dead slots and
+    // none of them dispatch at all while bossUsed is 0, so a bossless run is
+    // byte-for-byte the old frame.
+    this.bossInitPass = Fn(() => {
+      bpos.element(instanceIndex).assign(vec4(0, 0, 0, 0));
+      bdat.element(instanceIndex).assign(vec4(0, 0, 0, -1000));
+      batt.element(instanceIndex).assign(vec4(1, 0, -1000, 1));
+    })().compute(MAX_BOSSES);
+
+    this.bossSpawnPass = Fn(() => {
+      If(int(instanceIndex).lessThan(bu.spawnCount), () => {
+        const slot = bu.spawnCursor.add(int(instanceIndex)).mod(int(MAX_BOSSES)).toVar();
+        const s1 = hash(instanceIndex.add(uint(bu.spawnSeed))).toVar();
+        const s2 = hash(instanceIndex.add(uint(bu.spawnSeed)).add(uint(9871))).toVar();
+        const s3 = hash(instanceIndex.add(uint(bu.spawnSeed)).add(uint(31337))).toVar();
+        const off = vec2(s1.sub(0.5), s2.sub(0.5)).mul(bu.spawnSpread.mul(2));
+        // Same law as the horde: NEVER hatch inside rock, move to the nearest
+        // open cell rather than back toward a spawn centre that may be solid.
+        const at = vec2(
+          clamp(bu.spawnPos.x.add(off.x), float(BOSS_RADIUS), float(GRID_W).sub(BOSS_RADIUS)),
+          clamp(bu.spawnPos.y.add(off.y), float(BOSS_RADIUS), float(GRID_H).sub(BOSS_RADIUS)),
+        ).toVar();
+        If(isRock(at), () => { at.assign(nearestOpen(at, 6)); });
+        bpos.element(slot).assign(vec4(at, 0, 0));
+        bdat.element(slot).assign(vec4(bu.spawnHp, 0, s3, 0));
+        // batt.w is the RENDER jitter over a fixed physics radius, the exact
+        // opposite of the horde's one-number rule -- deliberate (config.js):
+        // giants draw 4x-6x while all colliding at 4x, and the edge overlap
+        // that allows is the look we want.
+        const s4 = hash(instanceIndex.add(uint(bu.spawnSeed)).add(uint(5501))).toVar();
+        const jitter = mix(float(BOSS_RENDER_JITTER[0]), float(BOSS_RENDER_JITTER[1]), s4).toVar();
+        batt.element(slot).assign(vec4(bu.spawnSpeed, bu.spawnGold, -1000, jitter));
+      });
+    })().compute(BOSS_SPAWN_BATCH);
+
+    this.bossClearPass = Fn(() => {
+      atomicStore(bslots.element(instanceIndex), uint(0));
+      // Wipe the slots too, not just the counter: same ghost-corpse lesson as
+      // the fine hash's clear above.
+      const base = instanceIndex.mul(uint(BOSS_BUCKET_K));
+      for (let k = 0; k < BOSS_BUCKET_K; k++) {
+        bbucket.element(base.add(uint(k))).assign(uint(0));
+      }
+    })().compute(BOSS_GRID_W * BOSS_GRID_H);
+
+    this.bossScatterPass = Fn(() => {
+      const d = bdat.element(instanceIndex).toVar();
+      If(d.x.greaterThan(0), () => {
+        const p = bpos.element(instanceIndex).xy.toVar();
+        const inv = float(1 / BOSS_GRID_CELL);
+        const cx = int(clamp(p.x.mul(inv), float(0), float(BOSS_GRID_W - 1)));
+        const cy = int(clamp(p.y.mul(inv), float(0), float(BOSS_GRID_H - 1)));
+        const cell = cy.mul(int(BOSS_GRID_W)).add(cx).toVar();
+        const slot = atomicAdd(bslots.element(cell), uint(1)).toVar();
+        If(slot.lessThan(uint(BOSS_BUCKET_K)), () => {
+          bbucket.element(cell.mul(int(BOSS_BUCKET_K)).add(int(slot))).assign(instanceIndex.add(uint(1)));
+        }).Else(() => {
+          // Same silent-interpenetration failure mode as the fine hash, same
+          // gauge.
+          atomicAdd(cnt.element(8), uint(1));
+        });
+        // Turret aim reads hostileDens; a boss that counted as one shambler
+        // would never pull a beam off the crowd, so it counts as a squad.
+        // Fine-grid cell on purpose: this is the AIM map, not the boss hash.
+        // Free side effect: ramparts chew-check through the same map, so a
+        // boss leaning on a wall eats it like the squad it counts as.
+        const fx = int(clamp(p.x.mul(DENS_SCALE), float(0), float(DENS_W - 1)));
+        const fy = int(clamp(p.y.mul(DENS_SCALE), float(0), float(DENS_H - 1)));
+        atomicAdd(hostileDens.element(fy.mul(int(DENS_W)).add(fx)), uint(BOSS_AIM_WEIGHT));
+      });
+    })().compute(MAX_BOSSES);
+
+    this.bossMovePass = Fn(() => {
+      const i = instanceIndex;
+      const d = bdat.element(i).toVar();
+      If(d.x.lessThanEqual(0), () => { Return(); });
+      const P = bpos.element(i).toVar();
+      const A = batt.element(i).toVar();
+      const p = P.xy.toVar();
+      const v = P.zw.toVar();
+      const maxSpeed = A.x.toVar();
+      // The flow field steers, straight down the lane: no wander cone, a
+      // colossus walks like it owns the route (because it does).
+      const f = flowAt(p).toVar();
+      v.addAssign(f.mul(maxSpeed.mul(float(STEER_ACCEL))).mul(u.h));
+      const sp = length(v).add(1e-5).toVar();
+      If(sp.greaterThan(maxSpeed), () => { v.mulAssign(maxSpeed.div(sp)); });
+      const vmax = float(BOSS_RADIUS * TRAVEL_LIMIT).div(u.h).toVar();
+      const sp2 = length(v).add(1e-5).toVar();
+      If(sp2.greaterThan(vmax), () => { v.mulAssign(vmax.div(sp2)); });
+      bprev.element(i).assign(p);
+      const nx = p.x.add(v.x.mul(u.h)).toVar();
+      const ny = p.y.add(v.y.mul(u.h)).toVar();
+      If(isRock(p), () => {
+        // already buried: follow the escape field out, unimpeded
+      }).Else(() => {
+        If(isRock(vec2(nx, ny)), () => {
+          If(isRock(vec2(nx, p.y)), () => { nx.assign(p.x); });
+          If(isRock(vec2(p.x, ny)), () => { ny.assign(p.y); });
+          If(isRock(vec2(nx, ny)), () => { nx.assign(p.x); ny.assign(p.y); });
+        });
+      });
+      bpos.element(i).assign(vec4(nx, ny, v));
+    })().compute(MAX_BOSSES);
+
+    // Boss-boss contacts: same two-dispatch gather/write split as the horde's
+    // solver, over the coarse hash. All bosses share one radius, so the mass
+    // share is exactly half and minDist is a constant.
+    this.bossRelaxPass = Fn(() => {
+      const i = instanceIndex;
+      If(bdat.element(i).x.lessThanEqual(0), () => {
+        bcorr.element(i).assign(vec4(0));
+        Return();
+      });
+      const p = bpos.element(i).xy.toVar();
+      const push = vec2(0).toVar();
+      const hits = float(0).toVar();
+      const inv = float(1 / BOSS_GRID_CELL);
+      const cx = int(clamp(p.x.mul(inv), float(1), float(BOSS_GRID_W - 2))).toVar();
+      const cy = int(clamp(p.y.mul(inv), float(1), float(BOSS_GRID_H - 2))).toVar();
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const cell = cy.add(int(oy)).mul(int(BOSS_GRID_W)).add(cx.add(int(ox))).toVar();
+          for (let k = 0; k < BOSS_BUCKET_K; k++) {
+            const raw = bbucket.element(cell.mul(int(BOSS_BUCKET_K)).add(int(k))).toVar();
+            If(raw.greaterThan(uint(0)), () => {
+              const other = raw.sub(uint(1)).toVar();
+              If(other.notEqual(i), () => {
+                const q = bpos.element(other).xy.toVar();
+                const delta = p.sub(q).toVar();
+                const dist = length(delta).toVar();
+                const minDist = float(BOSS_RADIUS * 2);
+                If(dist.lessThan(minDist), () => {
+                  const degenerate = step(dist, float(1e-5));
+                  const ang = hash(i.add(other).add(uint(7331))).mul(6.2831853).toVar();
+                  const n = mix(delta.div(max(dist, float(1e-5))),
+                    vec2(cos(ang), sin(ang)), degenerate).toVar();
+                  push.addAssign(n.mul(minDist.sub(dist).mul(0.5)));
+                  hits.addAssign(1);
+                });
+              });
+            });
+          }
+        }
+      }
+      bcorr.element(i).assign(vec4(push.div(max(hits, float(1))), 0, 0));
+    })().compute(MAX_BOSSES);
+
+    this.bossApplyPass = Fn(() => {
+      const i = instanceIndex;
+      If(bdat.element(i).x.lessThanEqual(0), () => { Return(); });
+      const P = bpos.element(i).toVar();
+      const to = P.xy.add(bcorr.element(i).xy).toVar();
+      const fixed = pushOutOfRock(to, float(BOSS_RADIUS)).toVar();
+      const lim = float(BOSS_RADIUS);
+      const bounded = vec2(
+        clamp(fixed.x, lim, float(GRID_W).sub(lim)),
+        clamp(fixed.y, lim, float(GRID_H).sub(lim)),
+      ).toVar();
+      // Bosses feed the same impossible-state gauges as the horde: with only
+      // bosses on the board, any movement on 6/7 is a boss solver fault.
+      If(length(bounded.sub(fixed)).greaterThan(float(1e-4)), () => {
+        atomicAdd(cnt.element(6), uint(1));
+      });
+      If(isRock(bounded), () => { atomicAdd(cnt.element(7), uint(1)); });
+      bpos.element(i).assign(vec4(bounded, P.z, P.w));
+    })().compute(MAX_BOSSES);
+
+    this.bossFinishPass = Fn(() => {
+      const i = instanceIndex;
+      If(bdat.element(i).x.lessThanEqual(0), () => { Return(); });
+      const p = bpos.element(i).xy.toVar();
+      const v = p.sub(bprev.element(i)).div(u.h).toVar();
+      bpos.element(i).assign(vec4(p, v));
+    })().compute(MAX_BOSSES);
+
+    // Damage, death, bounty and leaks for bosses, once per frame like simPass.
+    // The weapon shapes are widened by half the boss radius so a beam that
+    // visibly crosses a giant's body registers even when its centre is off the
+    // line; hit budgets are the shared per-weapon atomics, so a boss competes
+    // for the same damage throughput as the crowd around it.
+    this.bossSimPass = Fn(() => {
+      const d = bdat.element(instanceIndex).toVar();
+      If(d.x.greaterThan(0), () => {
+        const P = bpos.element(instanceIndex).toVar();
+        const A = batt.element(instanceIndex).toVar();
+        const p = P.xy.toVar();
+        const hp = d.x.toVar();
+        const dmg = float(0).toVar();
+        const touched = float(0).toVar();
+        Loop(u.turretCount, ({ i }) => {
+          const TA = this.turretA.element(i).toVar();   // x0, y0, kind, dps
+          const TB = this.turretB.element(i).toVar();   // x1, y1, halfWidth, radius
+          const inside = float(0).toVar();
+          If(TA.z.lessThan(0.5), () => {
+            If(length(p.sub(TA.xy)).lessThan(TB.w.add(float(BOSS_RADIUS * 0.5))), () => { inside.assign(1); });
+          }).Else(() => {
+            const ab = TB.xy.sub(TA.xy).toVar();
+            const t = clamp(dot(p.sub(TA.xy), ab).div(dot(ab, ab).add(1e-4)), 0, 1).toVar();
+            const close = TA.xy.add(ab.mul(t)).toVar();
+            If(length(p.sub(close)).lessThan(TB.z.add(float(BOSS_RADIUS * 0.5))), () => { inside.assign(1); });
+          });
+          If(inside.greaterThan(0.5), () => {
+            touched.assign(1);
+            const slot = atomicAdd(cnt.element(budgetAt(i)), uint(1));
+            If(float(slot).lessThan(this.turretC.element(i).x), () => { dmg.addAssign(TA.w); });
+          });
+        });
+        Loop(u.blastCount, ({ i }) => {
+          const B = this.blastArr.element(i).toVar();
+          If(length(p.sub(B.xy)).lessThan(B.z.add(float(BOSS_RADIUS * 0.5))), () => {
+            touched.assign(1);
+            const slot = atomicAdd(cnt.element(budgetAt(i.add(int(MAX_TURRETS)))), uint(1));
+            If(float(slot).lessThan(this.blastCaps.element(i).x), () => { dmg.addAssign(B.w); });
+          });
+        });
+        If(dmg.greaterThan(0), () => { hp.subAssign(dmg.mul(u.dt)); });
+        If(touched.greaterThan(0.5), () => { A.z.assign(u.time); });   // flash
+        const atBase = length(p.sub(u.basePos)).lessThan(1.7)
+          .or(pathDist(p).lessThan(0.004));
+        If(atBase, () => {
+          hp.assign(-1);
+          d.w.assign(u.time);
+          atomicAdd(cnt.element(11), uint(1));
+        });
+        d.x.assign(max(hp, 0));
+        batt.element(instanceIndex).assign(A);
+      });
+      // Death accounting outside the alive branch, same reasoning as simPass:
+      // a leak above sets d.w first, so it can never double-count as a kill.
+      If(d.x.lessThanEqual(0).and(d.w.equal(0)), () => {
+        d.w.assign(u.time);
+        atomicAdd(cnt.element(12), uint(1));
+        atomicAdd(cnt.element(2), uint(max(batt.element(instanceIndex).y, 1)));
+      });
+      bdat.element(instanceIndex).assign(d);
+    })().compute(MAX_BOSSES);
+
     // ---- render ------------------------------------------------------------
     // Plain Mesh + InstancedBufferGeometry rather than InstancedMesh: an
     // InstancedMesh would multiply positionLocal by its (default zeroed)
@@ -1202,7 +1481,58 @@ export class Horde {
     this.bulletMesh.frustumCulled = false;
     this.bulletMesh.renderOrder = 3;
 
+    // ---- boss render: same instanced-quad trick, one 32px tile. batt.w is
+    // the per-boss render jitter over the fixed physics radius, so what you
+    // SEE is 4x-6x while everything collides at 4x.
+    const gGeo = new THREE.InstancedBufferGeometry();
+    gGeo.setAttribute('position', src.getAttribute('position'));
+    gGeo.setAttribute('uv', src.getAttribute('uv'));
+    gGeo.setIndex(src.getIndex());
+    gGeo.instanceCount = 1;
+
+    const gPosA = bpos.toAttribute();
+    const gDatA = bdat.toAttribute();
+    const gAttA = batt.toAttribute();
+
+    const gAlive = step(0.001, gDatA.x);
+    const gAge = u.time.sub(gDatA.w);
+    const gFade = clamp(float(CORPSE_FADE).sub(gAge).div(float(CORPSE_FADE * 0.2)), 0, 1);
+    const gWet = clamp(float(1).sub(gAge.div(2.5)), 0, 1);
+    const gSpark = clamp(float(1).sub(gAge.mul(6)), 0, 1).mul(float(1).sub(gAlive));
+    const gVis = mix(gFade, float(1), gAlive);
+    const gLive = step(0.001, gVis);
+    const gHitPop = clamp(float(1).sub(u.time.sub(gAttA.z).mul(5)), 0, 1).mul(gAlive);
+    const gSize = float(BOSS_RADIUS).mul(gAttA.w).mul(float(SPRITE_PER_RADIUS))
+      .mul(float(1).add(gHitPop.mul(0.25)).add(gSpark.mul(0.5)))
+      .mul(gLive);
+
+    const gMat = new THREE.MeshBasicNodeMaterial();
+    gMat.positionNode = vec3(
+      gPosA.xy.add(positionGeometry.xy.mul(gSize)),
+      // A dead giant is terrain the horde walks over; a live one towers over
+      // everything, so it draws above the living crowd at 0.10.
+      mix(float(0.04), float(0.12), gAlive),
+    );
+    const gTex = texture(bossTexture, uv());
+    const gDry = mix(vec3(0.34, 0.07, 0.06), vec3(1), gWet);
+    gMat.colorNode = gTex.rgb.mul(mix(gDry, vec3(1), gAlive))
+      .add(vec3(gHitPop.mul(1.1), gHitPop.mul(0.25), gHitPop.mul(0.05)))
+      .add(vec3(gSpark.mul(1.6), gSpark.mul(1.3), gSpark.mul(0.8)));
+    gMat.opacityNode = gTex.a;
+    gMat.transparent = false;
+    gMat.alphaTest = 0.5;
+
+    this.bossMesh = new THREE.Mesh(gGeo, gMat);
+    this.bossMesh.frustumCulled = false;
+    this.bossMesh.renderOrder = 2;
+
     this._spawnQueue = [];
+    this._bossQueue = [];
+    this.bossCursor = 0;
+    this.bossStats = { spawned: 0, kills: 0, leaks: 0, alive: 0 };
+    this._lastBossKills = 0;
+    this._lastBossLeaks = 0;
+    this.pendingBossLeaks = 0;
     this._seed = 1;
   }
 
@@ -1214,6 +1544,32 @@ export class Horde {
   async init() {
     await this.renderer.computeAsync(this.initPass);
     await this.renderer.computeAsync(this.bulletClearPass);
+    await this.renderer.computeAsync(this.bossInitPass);
+    await this.renderer.computeAsync(this.bossClearPass);
+  }
+
+  // Compile every kernel behind the boot screen instead of on its first real
+  // dispatch. WGSL compilation happens synchronously on the main thread the
+  // first time a pass is dispatched, and the big unrolled kernels take real
+  // time: without this the first wave (or the first boss) froze the tab for
+  // the compile instead of the loader doing it under an honest message.
+  // Slot 0 is a dead body at boot, so every pass early-outs; this is compile,
+  // not simulation.
+  async warmup() {
+    const passes = [
+      this.clearPass, this.spawnPass, this.movePass, this.scatterPass,
+      this.relaxPass, this.applyPass, this.finishPass, this.simPass,
+      this.bulletSpawnPass, this.bulletPass,
+      this.bossClearPass, this.bossSpawnPass, this.bossMovePass,
+      this.bossScatterPass, this.bossRelaxPass, this.bossApplyPass,
+      this.bossFinishPass, this.bossSimPass,
+    ];
+    for (const p of passes) {
+      const n = p.count;
+      p.count = 1;
+      await this.renderer.computeAsync(p);
+      p.count = n;
+    }
   }
 
   // Muzzle events for this frame: {x, y, angle, rounds}. Rounds are clamped to
@@ -1258,9 +1614,19 @@ export class Horde {
     this._muzzleCount = 0;
     this._bulletCursor = 0;
     this.u.muzzleCount.value = 0;
+    this._bossQueue.length = 0;
+    this.bossCursor = 0;
+    this.bossStats = { spawned: 0, kills: 0, leaks: 0, alive: 0 };
+    this._lastBossKills = 0;
+    this._lastBossLeaks = 0;
+    this.pendingBossLeaks = 0;
+    this.u.bossCount.value = 0;
+    this.bossUsed = 0;
     await this.renderer.computeAsync(this.counterResetPass);
     await this.renderer.computeAsync(this.initPass);
     await this.renderer.computeAsync(this.bulletClearPass);
+    await this.renderer.computeAsync(this.bossInitPass);
+    await this.renderer.computeAsync(this.bossClearPass);
   }
 
   // Queued rather than dispatched immediately so a wave can ask for several
@@ -1268,6 +1634,17 @@ export class Horde {
   spawn(count, { pos, hp, type, speed, gold, scale, spread = 1.6 }) {
     if (count <= 0) return;
     this._spawnQueue.push({ count: Math.min(count, SPAWN_BATCH), pos, hp, type, speed, gold, scale, spread });
+  }
+
+  // Bosses self-batch: a flood call can ask for thousands and the queue drains
+  // a couple of dispatches per frame, same as the horde's spawn ring.
+  spawnBosses(count, { pos, hp, speed, gold, spread = 2.5 }) {
+    let left = Math.max(0, Math.floor(count));
+    while (left > 0) {
+      const c = Math.min(left, BOSS_SPAWN_BATCH);
+      left -= c;
+      this._bossQueue.push({ count: c, pos, hp, speed, gold, spread });
+    }
   }
 
   update(dt, time) {
@@ -1299,13 +1676,41 @@ export class Horde {
       bursts++;
     }
 
+    // Boss spawn bursts, same shape as the horde's: each is its own tiny
+    // dispatch so a mixed frame (wave drip + a flood call) keeps its uniforms
+    // straight.
+    let bossBursts = 0;
+    while (this._bossQueue.length && bossBursts < 2) {
+      const s = this._bossQueue.shift();
+      const bu = this.bu;
+      bu.spawnCount.value = s.count;
+      bu.spawnCursor.value = this.bossCursor;
+      bu.spawnPos.value.set(s.pos.x, s.pos.y);
+      bu.spawnSpread.value = s.spread;
+      bu.spawnHp.value = s.hp;
+      bu.spawnSpeed.value = s.speed;
+      bu.spawnGold.value = s.gold;
+      bu.spawnSeed.value = (this._seed = (this._seed * 1664525 + 1013904223) & 0x7fffffff);
+      renderer.compute(this.bossSpawnPass);
+      this.bossCursor = (this.bossCursor + s.count) % MAX_BOSSES;
+      this.bossStats.spawned += s.count;
+      bossBursts++;
+    }
+
     // Only dispatch over slots that have ever held an zombie. Early waves cost a
     // few thousand threads instead of the full capacity, and the same window
     // bounds the draw call.
     const used = Math.min(MAX_ZOMBIES, this.stats.spawned);
     this.used = used;
     this.mesh.geometry.instanceCount = Math.max(1, used);
-    if (used > 0) {
+    const bossUsed = Math.min(MAX_BOSSES, this.bossStats.spawned);
+    this.bossUsed = bossUsed;
+    // The uniform doubles as the branch guard in relaxPass: zero means the
+    // zombie kernel never reads the boss hash at all.
+    this.u.bossCount.value = bossUsed;
+    this.bossMesh.geometry.instanceCount = Math.max(1, bossUsed);
+
+    if (used > 0 || bossUsed > 0) {
       // Substeps scale with how far a body would travel this frame. At 1x the
       // crowd barely moves half a radius per frame and needs almost nothing; at
       // 5x fast-forward it would cross several bodies in a single step, which is
@@ -1316,25 +1721,50 @@ export class Horde {
 
       for (const pass of [this.scatterPass, this.movePass, this.relaxPass,
         this.applyPass, this.finishPass, this.simPass]) pass.count = used;
+      for (const pass of [this.bossScatterPass, this.bossMovePass, this.bossRelaxPass,
+        this.bossApplyPass, this.bossFinishPass, this.bossSimPass]) pass.count = bossUsed;
 
       for (let s = 0; s < S; s++) {
+        // clearPass runs whenever ANYTHING is alive: it also wipes hostileDens
+        // (which boss scatter writes into) and refills the weapon budgets the
+        // boss sim spends from.
         renderer.compute(this.clearPass);      // hash must be rebuilt every substep
-        renderer.compute(this.movePass);
-        renderer.compute(this.scatterPass);
-        for (let k = 0; k < this.iterations; k++) {
-          renderer.compute(this.relaxPass);
-          renderer.compute(this.applyPass);
+        if (used > 0) {
+          renderer.compute(this.movePass);
+          renderer.compute(this.scatterPass);
         }
-        renderer.compute(this.finishPass);
+        if (bossUsed > 0) {
+          renderer.compute(this.bossClearPass);
+          renderer.compute(this.bossMovePass);
+          renderer.compute(this.bossScatterPass);
+        }
+        for (let k = 0; k < this.iterations; k++) {
+          if (bossUsed > 0) {
+            renderer.compute(this.bossRelaxPass);
+            renderer.compute(this.bossApplyPass);
+          }
+          if (used > 0) {
+            // Zombie relax reads the boss hash written above, so within an
+            // iteration bosses settle first and the crowd yields to where they
+            // actually are.
+            renderer.compute(this.relaxPass);
+            renderer.compute(this.applyPass);
+          }
+        }
+        if (used > 0) renderer.compute(this.finishPass);
+        if (bossUsed > 0) renderer.compute(this.bossFinishPass);
       }
 
       // Damage, death and leaks run ONCE, after the crowd has finished moving,
       // so turret DPS does not scale with the substep count.
-      renderer.compute(this.simPass);
+      if (used > 0) renderer.compute(this.simPass);
+      if (bossUsed > 0) renderer.compute(this.bossSimPass);
 
       // bullets after the last scatter, so the hash they test against is current
-      if (this._muzzleCount > 0) renderer.compute(this.bulletSpawnPass);
-      renderer.compute(this.bulletPass);
+      if (used > 0) {
+        if (this._muzzleCount > 0) renderer.compute(this.bulletSpawnPass);
+        renderer.compute(this.bulletPass);
+      }
       // Density snapshot is taken from the final substep's scatter. The clear at
       // the top of the next substep is what wipes it now.
       this._pollDensity();
@@ -1379,6 +1809,17 @@ export class Horde {
       this.stats.lost = this._lastLost;
       this.pendingSaved += dSaved;
       this.pendingLost += dLost;
+      // Boss counters: same monotonic-diff shape. Alive is derived (spawned
+      // minus dead) rather than counted, which drifts only once the boss ring
+      // wraps -- at 8k slots that is a deliberate flood, not a wave.
+      const bossLeaks = c[11] ?? 0;
+      const bossKills = c[12] ?? 0;
+      this.pendingBossLeaks += bossLeaks - this._lastBossLeaks;
+      this._lastBossLeaks = bossLeaks;
+      this._lastBossKills = bossKills;
+      this.bossStats.kills = bossKills;
+      this.bossStats.leaks = bossLeaks;
+      this.bossStats.alive = Math.max(0, this.bossStats.spawned - bossKills - bossLeaks);
       // Zombies overwritten by the spawn ring never report a death, so the derived
       // headcount would drift above capacity. Clamp it.
       this.stats.recycling = this.stats.spawned > this.capacity;
@@ -1488,6 +1929,7 @@ export class Horde {
 
   takeGold() { const g = this.pendingGold; this.pendingGold = 0; return g; }
   takeLeaks() { const l = this.pendingLeaks; this.pendingLeaks = 0; return l; }
+  takeBossLeaks() { const l = this.pendingBossLeaks; this.pendingBossLeaks = 0; return l; }
   takeSaved() { const s = this.pendingSaved; this.pendingSaved = 0; return s; }
   takeLost() { const l = this.pendingLost; this.pendingLost = 0; return l; }
 

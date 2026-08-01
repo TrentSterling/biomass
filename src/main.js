@@ -12,7 +12,7 @@ import { FlowOverlay } from './debug.js';
 import { Build } from './game/build.js';
 import { Waves } from './game/waves.js';
 import { Hud } from './hud.js';
-import { makeZombieAtlas } from './art.js';
+import { makeZombieAtlas, makeBossTexture } from './art.js';
 import { save } from './save.js';
 import { effects as metaEffects, relicsFor } from './meta.js';
 import { Menu } from './menu.js';
@@ -20,6 +20,7 @@ import { startAudio, resumeAudio, configureAudio, toggleMute, isMuted, sfx } fro
 import {
   GRID_W, GRID_H, MAX_ZOMBIES, BUILDS, BASE_HP, START_GOLD, ZOMBIE_TYPES, PARAMS, SPAWN_BATCH,
   DENS_W, DENS_H, DENS_SCALE, ABILITIES, SPEEDS, zombieRadius, SURVIVOR_REWARD,
+  BOSS, BOSS_RADIUS, BOSS_LEAK_DAMAGE,
 } from './config.js';
 
 // No ?map= means the title screen: the game still boots and plays itself behind
@@ -83,6 +84,16 @@ try {
 }
 
 // ---- world ------------------------------------------------------------------
+// Boot staging: kernel compilation is a genuine main-thread stall (WGSL
+// compiles synchronously on first dispatch), so the boot screen narrates it
+// and yields a couple of frames before each heavy step, or the message never
+// paints and the tab just reads as hung.
+const paintBoot = (msg) => {
+  hud.boot(msg);
+  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+};
+
+await paintBoot('Baking the map&hellip;');
 const flowTex = new THREE.DataTexture(field.flow, GRID_W, GRID_H, THREE.RGBAFormat, THREE.UnsignedByteType);
 flowTex.magFilter = THREE.NearestFilter;
 flowTex.minFilter = THREE.NearestFilter;
@@ -92,10 +103,14 @@ flowTex.needsUpdate = true;
 const ground = new Ground(field);
 scene.add(ground.mesh);
 
-const horde = new Horde(renderer, flowTex, makeZombieAtlas(), field.base);
+await paintBoot('Compiling GPU kernels &mdash; the tab may hold its breath for a moment&hellip;');
+const horde = new Horde(renderer, flowTex, makeZombieAtlas(), makeBossTexture(), field.base);
 await horde.init();
+await horde.warmup();
 scene.add(horde.mesh);
 scene.add(horde.bulletMesh);
+scene.add(horde.bossMesh);
+await paintBoot('Raising the horde&hellip;');
 
 const effects = new Effects(scene);
 const flowDebug = new FlowOverlay(scene, field);
@@ -106,6 +121,7 @@ build.onRampartLost = () => { hud.toast('a rampart has fallen'); sfx.leak(); };
 build.addCharge = addCharge;
 const waves = new Waves(field, horde);
 waves.onSurvivors = () => hud.toast('survivors incoming');
+waves.onBoss = () => hud.toast('a colossus approaches');
 
 // A rebake rewrites field.flow in place, so the GPU just needs the upload flag.
 const refreshField = () => {
@@ -361,6 +377,8 @@ addEventListener('keydown', (ev) => {
     else { enterSandbox(); hud.toast('sandbox on: base invulnerable'); }
   } else if (ev.key === 'm' || ev.key === 'M') {
     hud.toast(toggleMute() ? 'muted' : 'sound on');
+  } else if (ev.key === 'v' || ev.key === 'V') {
+    bossFlood(400);
   } else if (ev.key === 'n' || ev.key === 'N') {
     startMap((mapIndex + 1) % MAPS.length);
   } else if (ev.key === 'r' || ev.key === 'R') {
@@ -417,6 +435,17 @@ function flood(count = Math.floor(MAX_ZOMBIES / 2)) {
     });
   }
   hud.toast(`flooding ${batches * SPAWN_BATCH} zombies`);
+}
+
+// Fill the field with giants. The boss-flood scenario: same sandbox rules as
+// flood(), same centre-out scatter, sized to the whole board.
+function bossFlood(count = 400) {
+  enterSandbox();
+  horde.spawnBosses(count, {
+    pos: { x: GRID_W / 2, y: GRID_H / 2 }, hp: BOSS.hp, speed: BOSS.speed,
+    gold: BOSS.gold, spread: Math.min(GRID_W, GRID_H) / 2 - 2,
+  });
+  hud.toast(`flooding ${count} bosses`);
 }
 
 function cycleSpeed() {
@@ -680,7 +709,66 @@ globalThis.__biomass = () => ({
   beacons: build.beacons.length, rings: build.rings.length,
   planes: build.planes.length, fallingBombs: build.fallingBombs.length,
   spawnAt: { x: +field.spawns[0].x.toFixed(2), y: +field.spawns[0].y.toFixed(2) },
+  bossAlive: horde.bossStats.alive, bossSpawned: horde.bossStats.spawned,
+  bossKills: horde.bossStats.kills, bossLeaks: horde.bossStats.leaks,
+  bossQueued: horde._bossQueue.length,
 });
+
+// Test hook: drop a boss group. No args floods them centre-out across the
+// whole board; with coordinates they arrive as a tight squad.
+globalThis.__biomassBosses = (n, x, y) => {
+  enterSandbox();
+  horde.spawnBosses(n, {
+    pos: { x: x ?? GRID_W / 2, y: y ?? GRID_H / 2 },
+    hp: BOSS.hp, speed: BOSS.speed, gold: BOSS.gold,
+    spread: x != null ? 3 : Math.min(GRID_W, GRID_H) / 2 - 2,
+  });
+  return horde.bossStats.spawned + horde._bossQueue.reduce((a, b) => a + b.count, 0);
+};
+
+// Test hook: how deeply is the horde interpenetrating the giants? One-way
+// coupling is invisible to every existing gauge (bosses are not in the fine
+// hash), so this reads both pools back and measures it directly: of the
+// zombies within touching range of a boss, what share sit DEEP inside one.
+globalThis.__biomassBossPush = async () => {
+  const [bposBuf, bdatBuf, posBuf, datBuf, attBuf] = (await Promise.all([
+    horde.renderer.getArrayBufferAsync(horde._bossBuffers.bpos.value),
+    horde.renderer.getArrayBufferAsync(horde._bossBuffers.bdat.value),
+    horde.renderer.getArrayBufferAsync(horde._buffers.pos.value),
+    horde.renderer.getArrayBufferAsync(horde._buffers.dat.value),
+    horde.renderer.getArrayBufferAsync(horde._buffers.att.value),
+  ])).map((b) => new Float32Array(b));
+  const bosses = [];
+  const bn = Math.min(horde.bossUsed ?? 0, bdatBuf.length / 4);
+  for (let i = 0; i < bn && bosses.length < 2000; i++) {
+    if (bdatBuf[i * 4] <= 0) continue;
+    bosses.push([bposBuf[i * 4], bposBuf[i * 4 + 1]]);
+  }
+  const n = Math.min(horde.used ?? 0, datBuf.length / 4);
+  let near = 0, deep = 0, alive = 0;
+  const deepR = BOSS_RADIUS * 0.7;
+  for (let i = 0; i < n; i++) {
+    if (datBuf[i * 4] <= 0) continue;
+    alive++;
+    const x = posBuf[i * 4], y = posBuf[i * 4 + 1];
+    const touchR = BOSS_RADIUS + (attBuf[i * 4 + 3] || 0.15);
+    let best = Infinity;
+    for (const [bx, by] of bosses) {
+      const d = Math.hypot(x - bx, y - by);
+      if (d < best) best = d;
+      if (best < deepR) break;
+    }
+    if (best < touchR) near++;
+    if (best < deepR) deep++;
+  }
+  return {
+    bosses: bosses.length,
+    zombiesAlive: alive,
+    zombiesNearBosses: near,
+    deep,
+    deepPct: near ? +((deep / near) * 100).toFixed(2) : 0,
+  };
+};
 
 // Jitter gauge. Reads the crowd buffer twice a second apart and compares the
 // speed each zombie CLAIMS with the distance it actually covered.
@@ -994,6 +1082,15 @@ function tick(dt) {
     if (leaked && !BENCH && !state.sandbox) {
       state.hp -= leaked;
       sfx.leak();
+      if (state.hp <= 0) endRun(false);
+    }
+    // Boss leaks hit like a squad arriving at once. Drained unconditionally
+    // (same as takeLeaks) so sandbox does not bank a killing blow for later.
+    const bossLeaked = horde.takeBossLeaks();
+    if (bossLeaked && !BENCH && !state.sandbox) {
+      state.hp -= bossLeaked * BOSS_LEAK_DAMAGE;
+      sfx.leak();
+      hud.toast('a colossus reached the base');
       if (state.hp <= 0) endRun(false);
     }
 

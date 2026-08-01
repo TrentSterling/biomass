@@ -259,6 +259,65 @@ export function makeZombieAtlas() {
   return pixelTexture(c);
 }
 
+// Boss: a colossus, drawn at 32px because it renders 4x-6x the size of
+// anything else and a 16px blowup reads as static. Same species cues as the
+// horde (outstretched reach, asymmetry, one clouded eye) scaled to something
+// that shoulders through a crowd: a swollen trunk, plated shoulder line,
+// knuckles dragging at the sides, and a split down the gut.
+const BOSS_PX = 32;
+const BOSS_BODY = [
+  [5, 12], [6, 18], [7, 22], [8, 24], [9, 26], [10, 26], [11, 26], [12, 26],
+  [13, 26], [14, 26], [15, 24], [16, 24], [17, 22], [18, 22], [19, 20],
+  [20, 18], [21, 16], [22, 14], [23, 10],
+];
+export function makeBossTexture() {
+  const c = canvas(BOSS_PX, BOSS_PX);
+  const ctx = c.getContext('2d');
+  const cx = BOSS_PX / 2;
+  const body = '#5c6b4e';
+  const dark = '#1c231a';
+  const light = '#8fa07a';
+  const wound = '#7a2018';
+
+  ctx.fillStyle = dark;
+  for (const [y, w] of BOSS_BODY) ctx.fillRect(cx - w / 2 - 1, y - 1, w + 2, 3);
+  ctx.fillStyle = body;
+  for (const [y, w] of BOSS_BODY) ctx.fillRect(cx - w / 2, y, w, 1);
+
+  // knuckle-dragging arms, wider than any zombie's reach and hanging low
+  ctx.fillStyle = dark;
+  ctx.fillRect(cx - 15, 9, 5, 9);
+  ctx.fillRect(cx + 10, 10, 5, 8);
+  ctx.fillStyle = body;
+  ctx.fillRect(cx - 14, 10, 3, 7);
+  ctx.fillRect(cx + 11, 11, 3, 6);
+
+  // plated shoulder band, the husk cue scaled up
+  ctx.fillStyle = light;
+  ctx.fillRect(cx - 10, 7, 20, 3);
+  ctx.fillStyle = dark;
+  ctx.fillRect(cx - 10, 9, 20, 1);
+
+  // skull: one clouded eye, one dark socket, both oversized
+  ctx.fillStyle = '#0d1108';
+  ctx.fillRect(cx - 6, 12, 4, 3);
+  ctx.fillRect(cx + 2, 12, 4, 3);
+  ctx.fillStyle = '#d8e8c0';
+  ctx.fillRect(cx + 3, 12, 2, 2);
+
+  // the gut split, ragged and off-centre
+  ctx.fillStyle = wound;
+  ctx.fillRect(cx + 1, 17, 4, 4);
+  ctx.fillRect(cx + 3, 20, 3, 3);
+  ctx.fillRect(cx - 1, 19, 2, 2);
+
+  // two heavy feet, both dragging
+  ctx.fillStyle = dark;
+  ctx.fillRect(cx - 8, 26, 6, 3);
+  ctx.fillRect(cx + 2, 26, 6, 4);
+  return pixelTexture(c);
+}
+
 // Turret atlas: five behaviours x three tiers, so a turret's silhouette changes
 // as it climbs. Tier is level 1-2, 3-4, 5-6. Everything is drawn barrel-along-+x
 // so the sprite can simply be rotated to the aim angle.

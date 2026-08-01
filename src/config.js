@@ -188,6 +188,50 @@ export const SURVIVOR_CHEW_DPS = 5;
 // Gold paid out per survivor that reaches the base alive.
 export const SURVIVOR_REWARD = 15;
 
+// ---- bosses -----------------------------------------------------------------
+// Stupidly big giants, and the reason they can exist at all: they NEVER enter
+// the zombie spatial hash. The fine grid's whole design caps the largest
+// contact diameter at its half-unit cell (see DENS_SCALE above); a 4x body in
+// that hash would force a giant cell, a giant BUCKET_K, and a shader that will
+// not run. So bosses live in their own pool with their own COARSE hash, and
+// the two populations couple one way only: zombies are pushed out of bosses,
+// bosses ignore zombie contacts entirely. At ~16x the mass that is physically
+// honest, it reads as "boss", and it deletes the expensive direction (a boss
+// gathering thousands of zombie neighbours).
+export const MAX_BOSSES = Math.max(256, Math.min(65536, Number(QUERY.get('bosses')) || 8192));
+export const BOSS_SPAWN_BATCH = 256;
+// Physics radius, fixed: 4x the reference zombie radius. Render decompresses
+// on top of this (a per-boss jitter up to 1.5x drawn over the same circle), so
+// giants LOOK 4x-6x while colliding at a uniform 4x. Some sprite overlap at
+// the edges is the point: horde mush, not snooker balls.
+export const BOSS_RADIUS = ZOMBIE_RADIUS * 4;
+export const BOSS_RENDER_JITTER = [1.1, 1.5];      // drawn scale over physics radius
+// Boss hash: cell must clear one boss contact diameter (2 * 0.84 = 1.68), so a
+// 2-unit cell with a 3x3 gather sees every touching pair, same law as the fine
+// grid. A 4-square-unit cell packs under 2 bosses, so 8 slots is generous.
+export const BOSS_GRID_CELL = 2;
+export const BOSS_GRID_W = GRID_W / BOSS_GRID_CELL;
+export const BOSS_GRID_H = GRID_H / BOSS_GRID_CELL;
+export const BOSS_BUCKET_K = 8;
+// Zombie-side reach into a boss: boss radius + the fattest zombie. Under one
+// boss cell, which is what lets the zombie kernel cover it with a 2x2 gather
+// instead of 3x3.
+export const BOSS_REACH = BOSS_RADIUS + ZOMBIE_RADIUS_MAX;
+// The archetype. Slow, worth a pile of gold, and hp sized so a mid-game kit
+// has to actually commit to one.
+export const BOSS = { name: 'colossus', hp: 2600, speed: 2.0, gold: 90 };
+// One boss reaching the base hurts like a squad leaking at once.
+export const BOSS_LEAK_DAMAGE = 10;
+// A boss pressed against a survivor chews like this many shamblers.
+export const BOSS_CHEW_WEIGHT = 6;
+// What a boss reads as in the turret-aim density map. Turrets aim at
+// hostileDens; a boss that counted as one shambler would never pull a beam.
+export const BOSS_AIM_WEIGHT = 6;
+// Waves: bosses join at this wave, linear ramp after.
+export const BOSS_FROM_WAVE = 6;
+export const bossCountFor = (n) =>
+  n < BOSS_FROM_WAVE ? 0 : 1 + Math.floor((n - BOSS_FROM_WAVE) * 0.8);
+
 // Rampart footprint in sim cells: half an authored block, so a 4-cell corridor
 // can be narrowed to 2 instead of only being sealed.
 export const RAMPART = 2;

@@ -56,6 +56,13 @@ export class Hud {
     this.el.hud.hidden = false;
   }
 
+  // Boot-stage progress line. Same element as fail(): the boot screen is the
+  // one place the player is looking while the tab holds its breath compiling
+  // kernels, so it had better say so.
+  boot(msg) {
+    this.el.bootmsg.innerHTML = msg;
+  }
+
   fail(msg) {
     this.el.bootmsg.innerHTML = msg;
   }
